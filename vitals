@@ -379,6 +379,9 @@ class Alert:
     title: str
     body: str
     detail: dict = field(default_factory=dict)
+    # Event alerts record something that happened rather than a condition that
+    # is still true. They fire once and leave without a recovery notice.
+    event: bool = False
 
 
 def checks(snap: dict) -> list[Alert]:
@@ -503,7 +506,7 @@ def check_journal() -> list[Alert]:
         out.append(Alert(
             "journal_mce", "crit", "Hardware error in the kernel log",
             f"{len(lines)} machine-check line(s): {lines[0][:160]}",
-            {"lines": lines[:5]},
+            {"lines": lines[:5]}, event=True,
         ))
     if "nvrm_oom" in hits:
         lines = hits["nvrm_oom"]
@@ -511,7 +514,7 @@ def check_journal() -> list[Alert]:
             "journal_nvrm", "warn", "GPU is out of mappable memory",
             f"{len(lines)} NVRM allocation failure(s). Browser and video "
             f"processes are likely to start crashing.",
-            {"lines": lines[:5]},
+            {"lines": lines[:5]}, event=True,
         ))
     return out
 
@@ -576,7 +579,8 @@ def check_smart(snap: dict) -> list[Alert]:
         if errors and (was is None or errors > was):
             out.append(Alert(
                 f"smart_media:{dev}", "crit", f"{model} reported data integrity errors",
-                f"Media and data integrity errors: {errors}", {"device": dev},
+                f"Media and data integrity errors: {errors}",
+                {"device": dev}, event=True,
             ))
 
         # Rising unsafe shutdowns is the evidence for the UPS case (COS-181).
@@ -587,7 +591,7 @@ def check_smart(snap: dict) -> list[Alert]:
                 f"smart_unsafe:{dev}", "warn", "Unsafe shutdown recorded",
                 f"{model} count went {prior} -> {shutdowns}. The machine lost "
                 f"power without flushing its write cache.",
-                {"device": dev, "count": shutdowns},
+                {"device": dev, "count": shutdowns}, event=True,
             ))
 
     save_smart_counters(counters)
@@ -672,6 +676,7 @@ def dispatch(alerts: list[Alert], quiet: bool = False) -> None:
             "title": alert.title,
             "body": alert.body,
             "since": (previous or {}).get("since", now),
+            "event": alert.event,
             # Only a delivered alert starts the cooldown, so a --quiet run
             # cannot silence the next real one.
             "last_sent": now if sent else (previous or {}).get("last_sent", 0),
@@ -679,7 +684,9 @@ def dispatch(alerts: list[Alert], quiet: bool = False) -> None:
 
     for key in [k for k in state if not k.startswith("_") and k not in firing]:
         gone = state.pop(key)
-        if not quiet:
+        # An event never recovered, because it was never a standing condition.
+        # "Hardware error - Back to normal" would say the opposite.
+        if not quiet and not gone.get("event"):
             deliver(
                 Alert(key, gone.get("severity", "warn"), gone.get("title", key),
                       "Back to normal."),
