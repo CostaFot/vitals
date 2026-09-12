@@ -25,6 +25,8 @@ XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
 
 STATE_DIR = XDG_STATE / "vitals"
 SAMPLES = STATE_DIR / "samples.csv"
+READINGS = STATE_DIR / "readings.csv"
+SMART_LOG = STATE_DIR / "smart.jsonl"
 ALERT_STATE = STATE_DIR / "alerts.json"
 ALERT_LOG = STATE_DIR / "alerts.jsonl"
 CURSOR = STATE_DIR / "journal.cursor"
@@ -282,20 +284,74 @@ def record_sample(snap: dict) -> None:
         if new:
             fh.write("ts,load1,tctl,tccd1,tccd2,gpu_temp,gpu_fan\n")
         fh.write(",".join(row) + "\n")
-    trim_samples()
+    trim_csv(SAMPLES)
 
 
-def trim_samples() -> None:
-    if not SAMPLES.exists():
+def trim_csv(path: Path) -> None:
+    """Cut a file back to the retention window.
+
+    Trimming the moment the oldest row expires would rewrite the whole file
+    every minute, forever. The file is allowed to run a day over instead, so
+    this rewrites once a day.
+    """
+    if not path.exists():
+        return
+    lines = path.read_text().splitlines()
+    if len(lines) < 2:
         return
     cutoff = time.time() - CONFIG["sample_retention_days"] * 86400
-    lines = SAMPLES.read_text().splitlines()
-    if not lines:
+    if _ts_of(lines[1]) >= cutoff - 86400:
         return
     header, rows = lines[0], lines[1:]
     kept = [r for r in rows if _ts_of(r) >= cutoff]
     if len(kept) != len(rows):
-        SAMPLES.write_text("\n".join([header, *kept]) + "\n")
+        path.write_text("\n".join([header, *kept]) + "\n")
+
+
+def record_readings(snap: dict) -> None:
+    """Drive temperatures and disk usage, which samples.csv has no column for.
+
+    Long format (ts, metric, subject, value) so that another drive, another
+    sensor or another mount does not shift everything that came before.
+    """
+    ts = f"{snap['ts']:.0f}"
+    rows = []
+    for drive in snap["sensors"].get("drives", {}).values():
+        for label, temp in drive["temps"].items():
+            rows.append((ts, "drive_temp", f"{drive['model']}/{label}", f"{temp:.1f}"))
+    for path, usage in snap["disks"].items():
+        rows.append((ts, "disk_pct", path, f"{usage['pct']:.2f}"))
+        rows.append((ts, "disk_free_gb", path, f"{usage['free'] / 1024**3:.1f}"))
+    if not rows:
+        return
+    READINGS.parent.mkdir(parents=True, exist_ok=True)
+    new = not READINGS.exists()
+    with READINGS.open("a") as fh:
+        if new:
+            fh.write("ts,metric,subject,value\n")
+        for row in rows:
+            fh.write(",".join(row) + "\n")
+    trim_csv(READINGS)
+
+
+def record_smart(snap: dict) -> None:
+    """The root timer overwrites root.json hourly, so wear, media errors and
+    shutdown counts would have no history at all. Keep one line per probe."""
+    facts = dict(snap.get("root") or {})
+    facts.pop("age_hours", None)
+    if not facts.get("drives") or not facts.get("ts"):
+        return
+    if SMART_LOG.exists():
+        lines = SMART_LOG.read_text().splitlines()
+        if lines:
+            try:
+                if json.loads(lines[-1]).get("ts") == facts["ts"]:
+                    return  # same hourly probe, already recorded
+            except json.JSONDecodeError:
+                pass
+    SMART_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with SMART_LOG.open("a") as fh:
+        fh.write(json.dumps(facts, sort_keys=True) + "\n")
 
 
 def _ts_of(row: str) -> float:
@@ -382,6 +438,9 @@ class Alert:
     # Event alerts record something that happened rather than a condition that
     # is still true. They fire once and leave without a recovery notice.
     event: bool = False
+    # Readings are the product; the log is read the next morning. Only alerts
+    # that mean "act now, not after breakfast" set this and reach the desktop.
+    emergency: bool = False
 
 
 def checks(snap: dict) -> list[Alert]:
@@ -433,7 +492,7 @@ def check_drive_temps(snap: dict) -> list[Alert]:
                     f"drive_temp_crit:{chip}:{label}", "crit",
                     f"{model} is critically hot",
                     f"{label} {temp:.1f}C, drive's own critical limit {crit:.1f}C",
-                    {"model": model, "sensor": label, "temp": temp},
+                    {"model": model, "sensor": label, "temp": temp}, emergency=True,
                 ))
             elif warn is not None and temp >= warn:
                 out.append(Alert(
@@ -549,13 +608,13 @@ def check_smart(snap: dict) -> list[Alert]:
             out.append(Alert(
                 f"smart_health:{dev}", "crit", f"{model} failed its SMART check",
                 f"Health: {drive.get('health')}. Back this drive up now.",
-                {"device": dev},
+                {"device": dev}, emergency=True,
             ))
         if drive.get("critical_warning"):
             out.append(Alert(
                 f"smart_warning:{dev}", "crit", f"{model} raised a critical warning",
                 f"NVMe critical_warning = {drive['critical_warning']}",
-                {"device": dev},
+                {"device": dev}, emergency=True,
             ))
 
         spare = drive.get("available_spare")
@@ -564,7 +623,7 @@ def check_smart(snap: dict) -> list[Alert]:
             out.append(Alert(
                 f"smart_spare:{dev}", "crit", f"{model} is out of spare blocks",
                 f"Available spare {spare}% at or below the drive's {spare_min}% floor",
-                {"device": dev},
+                {"device": dev}, emergency=True,
             ))
 
         used = drive.get("percentage_used")
@@ -636,11 +695,16 @@ def notify(title: str, body: str, severity: str, key: str) -> None:
 
 
 def deliver(alert: Alert, kind: str = "fire") -> None:
-    """The one place alerts leave the process. Remote delivery hooks in here."""
-    if kind == "fire":
-        notify(alert.title, alert.body, alert.severity, alert.key)
-    else:
-        notify(f"Recovered: {alert.title}", alert.body, "warn", alert.key)
+    """The one place alerts leave the process. Remote delivery hooks in here.
+
+    Everything is written to the log. Only an emergency is also allowed to put
+    something on screen; the rest is read back the next morning.
+    """
+    if alert.emergency:
+        if kind == "fire":
+            notify(alert.title, alert.body, alert.severity, alert.key)
+        else:
+            notify(f"Recovered: {alert.title}", alert.body, "warn", alert.key)
 
     ALERT_LOG.parent.mkdir(parents=True, exist_ok=True)
     with ALERT_LOG.open("a") as fh:
@@ -677,6 +741,7 @@ def dispatch(alerts: list[Alert], quiet: bool = False) -> None:
             "body": alert.body,
             "since": (previous or {}).get("since", now),
             "event": alert.event,
+            "emergency": alert.emergency,
             # Only a delivered alert starts the cooldown, so a --quiet run
             # cannot silence the next real one.
             "last_sent": now if sent else (previous or {}).get("last_sent", 0),
@@ -689,7 +754,8 @@ def dispatch(alerts: list[Alert], quiet: bool = False) -> None:
         if not quiet and not gone.get("event"):
             deliver(
                 Alert(key, gone.get("severity", "warn"), gone.get("title", key),
-                      "Back to normal."),
+                      "Back to normal.",
+                      emergency=gone.get("emergency", False)),
                 kind="clear",
             )
 
@@ -702,6 +768,8 @@ def dispatch(alerts: list[Alert], quiet: bool = False) -> None:
 def cmd_check(args: argparse.Namespace) -> int:
     snap = probe()
     record_sample(snap)
+    record_readings(snap)
+    record_smart(snap)
     alerts = checks(snap)
     dispatch(alerts, quiet=args.quiet)
     for alert in alerts:
@@ -843,6 +911,208 @@ def cmd_root_probe(args: argparse.Namespace) -> int:
     return 0
 
 
+def summarise(values: list[float]) -> dict | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    return {
+        "min": ordered[0],
+        "median": median(ordered),
+        "p95": ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))],
+        "max": ordered[-1],
+        "n": len(ordered),
+    }
+
+
+SAMPLE_COLUMNS = (("load1", 1), ("tctl", 2), ("tccd1", 3),
+                  ("tccd2", 4), ("gpu_temp", 5), ("gpu_fan", 6))
+
+
+def report_data(hours: float) -> dict:
+    """Everything the morning read needs, without handing over 1440 raw rows."""
+    since = time.time() - hours * 3600
+    data: dict = {"generated": time.time(), "since": since, "window_hours": hours}
+
+    parsed: list[tuple[float, dict]] = []
+    if SAMPLES.exists():
+        for row in SAMPLES.read_text().splitlines()[1:]:
+            parts = row.split(",")
+            ts = _ts_of(row)
+            if ts < since or len(parts) <= SAMPLE_COLUMNS[-1][1]:
+                continue
+            values = {}
+            for name, idx in SAMPLE_COLUMNS:
+                try:
+                    values[name] = float(parts[idx])
+                except ValueError:
+                    pass
+            parsed.append((ts, values))
+    parsed.sort(key=lambda pair: pair[0])
+
+    data["metrics"] = {
+        name: summarise([v[name] for _, v in parsed if name in v])
+        for name, _ in SAMPLE_COLUMNS
+    }
+    data["metrics"] = {k: v for k, v in data["metrics"].items() if v}
+
+    # Gaps say the machine was asleep or the timer stopped, which changes how
+    # the rest of the numbers should be read.
+    gaps = [
+        {"from": a, "to": b, "minutes": round((b - a) / 60)}
+        for (a, _), (b, _) in zip(parsed, parsed[1:]) if b - a > 180
+    ]
+    data["coverage"] = {
+        "samples": len(parsed), "expected": round(hours * 60), "gaps": gaps,
+    }
+
+    idle = [v["tccd2"] for _, v in parsed
+            if "tccd2" in v and v.get("load1", 99) <= CONFIG["idle_load_max"]]
+    data["idle_floor"] = {
+        "median": median(idle) if idle else None,
+        "samples": len(idle),
+        "limit": CONFIG["idle_floor_warn"],
+    }
+
+    drives: dict = {}
+    disks: dict = {}
+    if READINGS.exists():
+        for row in READINGS.read_text().splitlines()[1:]:
+            parts = row.split(",")
+            if len(parts) < 4 or _ts_of(row) < since:
+                continue
+            ts, metric, subject, raw = parts[0], parts[1], ",".join(parts[2:-1]), parts[-1]
+            try:
+                value = float(raw)
+            except ValueError:
+                continue
+            if metric == "drive_temp":
+                drives.setdefault(subject, []).append(value)
+            elif metric in ("disk_pct", "disk_free_gb"):
+                disks.setdefault(subject, {}).setdefault(metric, []).append(value)
+    data["drive_temps"] = {k: summarise(v) for k, v in sorted(drives.items())}
+    data["disks"] = {
+        path: {
+            "pct_start": series["disk_pct"][0], "pct_end": series["disk_pct"][-1],
+            "free_gb_end": series.get("disk_free_gb", [None])[-1],
+        }
+        for path, series in sorted(disks.items()) if series.get("disk_pct")
+    }
+
+    # The drive's own limits are static hardware facts, and without them a
+    # number like "Sensor 1 at 65C" cannot be judged.
+    limits: dict = {}
+    for drive in probe()["sensors"].get("drives", {}).values():
+        for label, bounds in drive.get("limits", {}).items():
+            limits[f"{drive['model']}/{label}"] = bounds
+    data["drive_limits"] = limits
+
+    smart = []
+    if SMART_LOG.exists():
+        for line in SMART_LOG.read_text().splitlines():
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if entry.get("ts", 0) >= since:
+                smart.append(entry)
+    counters = ("percentage_used", "media_errors", "unsafe_shutdowns",
+                "power_on_hours", "available_spare")
+    data["smart"] = {}
+    if smart:
+        first, last = smart[0].get("drives", {}), smart[-1].get("drives", {})
+        for dev, end in sorted(last.items()):
+            start = first.get(dev, {})
+            data["smart"][dev] = {
+                "model": end.get("model"), "health": end.get("health"),
+                "critical_warning": end.get("critical_warning"),
+                **{c: {"end": end.get(c), "delta": (end.get(c) or 0) - (start.get(c) or 0)}
+                   for c in counters},
+            }
+        data["smart_probes"] = len(smart)
+
+    alerts = []
+    if ALERT_LOG.exists():
+        for line in ALERT_LOG.read_text().splitlines():
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if entry.get("ts", 0) >= since:
+                alerts.append(entry)
+    data["alerts"] = alerts
+    return data
+
+
+def _clock(ts: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+
+def render_report(data: dict) -> str:
+    out = [f"vitals report  last {data['window_hours']:g}h  "
+           f"({_clock(data['since'])} -> {_clock(data['generated'])})", ""]
+
+    cov = data["coverage"]
+    line = f"coverage  {cov['samples']}/{cov['expected']} samples"
+    if cov["gaps"]:
+        line += f", {len(cov['gaps'])} gap(s)"
+    out.append(line)
+    for gap in cov["gaps"]:
+        out.append(f"          gap {_clock(gap['from'])} -> {_clock(gap['to'])} "
+                   f"({gap['minutes']} min)")
+    out.append("")
+
+    for name, stat in data["metrics"].items():
+        out.append(f"{name:9} min {stat['min']:6.1f}  median {stat['median']:6.1f}  "
+                   f"p95 {stat['p95']:6.1f}  max {stat['max']:6.1f}")
+
+    floor = data["idle_floor"]
+    if floor["median"] is None:
+        out.append(f"{'idlefloor':9} no idle samples in the window")
+    else:
+        out.append(f"{'idlefloor':9} median {floor['median']:.1f}C over "
+                   f"{floor['samples']} idle samples (limit {floor['limit']:.0f}C)")
+    out.append("")
+
+    for subject, stat in data["drive_temps"].items():
+        bounds = data["drive_limits"].get(subject, {})
+        warn = bounds.get("max")
+        tail = f"  (warn {warn:.0f}C)" if warn else ""
+        out.append(f"drive  {subject:45} min {stat['min']:5.1f}  "
+                   f"median {stat['median']:5.1f}  max {stat['max']:5.1f}{tail}")
+
+    for path, usage in data["disks"].items():
+        delta = usage["pct_end"] - usage["pct_start"]
+        free = usage["free_gb_end"]
+        free_text = f"  {free:.1f}G free" if free is not None else ""
+        out.append(f"disk   {path:45} {usage['pct_start']:.2f}% -> "
+                   f"{usage['pct_end']:.2f}%  ({delta:+.2f}){free_text}")
+
+    if data["smart"]:
+        out.append("")
+        for dev, drive in data["smart"].items():
+            parts = "  ".join(
+                f"{c} {drive[c]['end']} ({drive[c]['delta']:+})"
+                for c in ("percentage_used", "media_errors", "unsafe_shutdowns")
+            )
+            out.append(f"smart  {drive['model']}: {drive['health']}  {parts}")
+
+    out.append("")
+    if data["alerts"]:
+        for entry in data["alerts"]:
+            mark = "FIRE" if entry["kind"] == "fire" else "CLEAR"
+            out.append(f"alert  {_clock(entry['ts'])}  {mark:5} [{entry['severity']}] "
+                       f"{entry['title']}: {entry['body']}")
+    else:
+        out.append("alert  nothing logged in the window")
+    return "\n".join(out)
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    data = report_data(args.hours)
+    print(json.dumps(data, indent=2) if args.json else render_report(data))
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="vitals", description="watch the things that can take this desktop down"
@@ -862,6 +1132,12 @@ def main() -> int:
     log = sub.add_parser("log", help="recent alerts")
     log.add_argument("-n", type=int, default=20, help="how many lines")
     log.set_defaults(func=cmd_log)
+
+    report = sub.add_parser("report", help="summarise a window for the morning read")
+    report.add_argument("--hours", type=float, default=24.0,
+                        help="how far back to look (default 24)")
+    report.add_argument("--json", action="store_true", help="machine readable")
+    report.set_defaults(func=cmd_report)
 
     sub.add_parser("root-probe", help="write SMART facts (run as root)"
                    ).set_defaults(func=cmd_root_probe)
