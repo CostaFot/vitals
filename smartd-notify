@@ -1,0 +1,30 @@
+#!/bin/sh
+# smartd's '-M exec' target. smartd runs as root, so the notification has to be
+# handed to the desktop session rather than sent from here.
+#
+# smartd owns the drive emergencies: '-H' checks the NVMe critical-warning byte,
+# which is where the drive itself reports failed health, spare blocks at the
+# floor, and passing its own critical temperature. This script only carries the
+# message. Everything else vitals watches stays quiet and is read back by
+# 'vitals report'.
+set -u
+
+drive="${SMARTD_DEVICESTRING:-a drive}"
+title="SMART warning: $drive"
+body="${SMARTD_MESSAGE:-smartd reported a problem. Run: smartctl -a $drive}"
+
+# Leave a copy in the system journal even if no session is logged in, so
+# 'vitals report' still finds it in the morning.
+logger -t vitals-smartd -p daemon.crit "${SMARTD_FAILTYPE:-warning}: $drive: $body"
+
+for bus in /run/user/*/bus; do
+    [ -S "$bus" ] || continue
+    uid=$(basename "$(dirname "$bus")")
+    # Skip system users; only a real login has a desktop to notify.
+    [ "$uid" -ge 1000 ] 2>/dev/null || continue
+    user=$(id -nu "$uid" 2>/dev/null) || continue
+    runuser -u "$user" -- env "DBUS_SESSION_BUS_ADDRESS=unix:path=$bus" \
+        notify-send -a vitals -u critical -i dialog-error \
+        -h "string:x-canonical-private-synchronous:vitals-smartd-$drive" \
+        "$title" "$body" 2>/dev/null || true
+done

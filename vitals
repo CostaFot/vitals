@@ -94,6 +94,17 @@ def run(cmd: list[str], timeout: int = 15) -> str | None:
     return out.stdout if out.returncode == 0 else None
 
 
+def systemctl_state(verb: str, unit: str) -> str:
+    """systemctl exits non-zero for "inactive" and "disabled", which are both
+    answers rather than failures, so run() would throw them away."""
+    try:
+        out = subprocess.run(["systemctl", verb, unit], capture_output=True,
+                             text=True, timeout=5, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+    return out.stdout.strip() or "unknown"
+
+
 def nvme_chip_map() -> dict[str, str]:
     """sensors chip name -> drive model, via the PCI address in the chip name."""
     out = {}
@@ -242,6 +253,31 @@ def read_journal() -> dict[str, list[str]]:
     return hits
 
 
+def read_smartd() -> dict:
+    """smartd owns the drive emergencies. Its '-H' directive reads the NVMe
+    critical-warning byte, which is the drive's own verdict on failed health,
+    spare blocks at the floor, and passing its critical temperature. vitals does
+    not second-guess it; it only reports whether it is running."""
+    return {
+        "active": systemctl_state("is-active", "smartd.service"),
+        "enabled": systemctl_state("is-enabled", "smartd.service"),
+    }
+
+
+def smartd_messages(since: float) -> list[str]:
+    """What smartd has logged at warning or worse. Two sources, OR'd with '+':
+    smartd's own LOG_CRIT when a critical-warning bit is set, and smartd-notify,
+    which smartd forks outside its own cgroup - so those lines carry no
+    _SYSTEMD_UNIT and a '-u smartd.service' query silently misses them."""
+    raw = run([
+        "journalctl", "-p", "warning", "-o", "short-iso", "--no-pager",
+        f"--since=@{int(since)}",
+        "_SYSTEMD_UNIT=smartd.service", "+", "SYSLOG_IDENTIFIER=vitals-smartd",
+    ], timeout=30)
+    return [line.strip() for line in (raw or "").splitlines()
+            if line.strip() and not line.startswith("-- ")]
+
+
 def read_root_facts() -> dict:
     """SMART attributes dropped by the hourly root timer, if it is installed."""
     try:
@@ -260,6 +296,7 @@ def probe() -> dict:
         "gpu": read_gpu(),
         "disks": read_disks(),
         "root": read_root_facts(),
+        "smartd": read_smartd(),
     }
 
 
@@ -438,8 +475,10 @@ class Alert:
     # Event alerts record something that happened rather than a condition that
     # is still true. They fire once and leave without a recovery notice.
     event: bool = False
-    # Readings are the product; the log is read the next morning. Only alerts
-    # that mean "act now, not after breakfast" set this and reach the desktop.
+    # Readings are the product; the log is read the next morning. Nothing sets
+    # this any more - the four alerts that used to were all NVMe critical-warning
+    # bits, and smartd reads that byte itself. The flag and the notify path in
+    # deliver() stay because they are where a future non-drive emergency lands.
     emergency: bool = False
 
 
@@ -451,6 +490,7 @@ def checks(snap: dict) -> list[Alert]:
     found += check_disks(snap)
     found += check_journal()
     found += check_smart(snap)
+    found += check_smartd(snap)
     return found
 
 
@@ -492,7 +532,7 @@ def check_drive_temps(snap: dict) -> list[Alert]:
                     f"drive_temp_crit:{chip}:{label}", "crit",
                     f"{model} is critically hot",
                     f"{label} {temp:.1f}C, drive's own critical limit {crit:.1f}C",
-                    {"model": model, "sensor": label, "temp": temp}, emergency=True,
+                    {"model": model, "sensor": label, "temp": temp},
                 ))
             elif warn is not None and temp >= warn:
                 out.append(Alert(
@@ -604,27 +644,10 @@ def check_smart(snap: dict) -> list[Alert]:
             "media_errors": drive.get("media_errors"),
         }
 
-        if drive.get("health") not in (None, "PASSED"):
-            out.append(Alert(
-                f"smart_health:{dev}", "crit", f"{model} failed its SMART check",
-                f"Health: {drive.get('health')}. Back this drive up now.",
-                {"device": dev}, emergency=True,
-            ))
-        if drive.get("critical_warning"):
-            out.append(Alert(
-                f"smart_warning:{dev}", "crit", f"{model} raised a critical warning",
-                f"NVMe critical_warning = {drive['critical_warning']}",
-                {"device": dev}, emergency=True,
-            ))
-
-        spare = drive.get("available_spare")
-        spare_min = drive.get("available_spare_threshold")
-        if spare is not None and spare_min is not None and spare <= spare_min:
-            out.append(Alert(
-                f"smart_spare:{dev}", "crit", f"{model} is out of spare blocks",
-                f"Available spare {spare}% at or below the drive's {spare_min}% floor",
-                {"device": dev}, emergency=True,
-            ))
+        # Failed health, a critical warning and spare blocks at the floor are
+        # all bits in the same NVMe critical-warning byte, and smartd's '-H'
+        # reads that byte every half hour and shouts. They are still in
+        # 'vitals report' as facts, which is what the morning read wants.
 
         used = drive.get("percentage_used")
         if used is not None and used >= CONFIG["smart_percentage_used_warn"]:
@@ -655,6 +678,22 @@ def check_smart(snap: dict) -> list[Alert]:
 
     save_smart_counters(counters)
     return out
+
+
+def check_smartd(snap: dict) -> list[Alert]:
+    """A dead smartd means nothing is watching for a drive dying until someone
+    reads the report. Quiet like everything else, but the report leads with it."""
+    smartd = snap.get("smartd") or {}
+    active, enabled = smartd.get("active"), smartd.get("enabled")
+    if enabled != "enabled" or active == "active":
+        # Not installed is a choice, not a fault; 'vitals status' says so.
+        return []
+    return [Alert(
+        "smartd_down", "crit", "smartd is not running",
+        f"systemctl says {active}. Nothing is watching the drives for a "
+        f"critical warning until it is back: systemctl status smartd",
+        {"active": active},
+    )]
 
 
 # --- alert state and delivery ------------------------------------------------
@@ -697,8 +736,9 @@ def notify(title: str, body: str, severity: str, key: str) -> None:
 def deliver(alert: Alert, kind: str = "fire") -> None:
     """The one place alerts leave the process. Remote delivery hooks in here.
 
-    Everything is written to the log. Only an emergency is also allowed to put
-    something on screen; the rest is read back the next morning.
+    Everything is written to the log and nothing currently reaches the screen:
+    the drive emergencies moved to smartd, which notifies through smartd-notify.
+    The branch below stays because it is where a non-drive emergency would land.
     """
     if alert.emergency:
         if kind == "fire":
@@ -829,6 +869,15 @@ def cmd_status(args: argparse.Namespace) -> int:
                   f"{drive.get('media_errors')} media errors, "
                   f"{drive.get('unsafe_shutdowns')} unsafe shutdowns")
         print(f"       (read {age:.1f}h ago)")
+
+    smartd = snap.get("smartd") or {}
+    if smartd.get("enabled") == "enabled":
+        note = "watching for a critical warning" if smartd.get("active") == "active" \
+            else f"ENABLED BUT {smartd.get('active', 'unknown').upper()}"
+        print(f"smartd {smartd.get('active')} - {note}")
+    else:
+        print("smartd not enabled - nothing watches the drives between reports "
+              "(see install.sh --with-smart)")
 
     state = {k: v for k, v in load_alert_state().items() if not k.startswith("_")}
     if state:
@@ -1030,6 +1079,12 @@ def report_data(hours: float) -> dict:
             }
         data["smart_probes"] = len(smart)
 
+    # The emergency tier is smartd's, so the report has to say whether it was
+    # up and what it said. Otherwise a morning read cannot tell "no drive
+    # warnings" from "nothing was looking".
+    data["smartd"] = read_smartd()
+    data["smartd"]["messages"] = smartd_messages(since)
+
     alerts = []
     if ALERT_LOG.exists():
         for line in ALERT_LOG.read_text().splitlines():
@@ -1095,6 +1150,19 @@ def render_report(data: dict) -> str:
                 for c in ("percentage_used", "media_errors", "unsafe_shutdowns")
             )
             out.append(f"smart  {drive['model']}: {drive['health']}  {parts}")
+
+    out.append("")
+    smartd = data.get("smartd", {})
+    if smartd.get("enabled") != "enabled":
+        out.append("smartd not enabled - no drive was watched between reports")
+    elif smartd.get("active") != "active":
+        out.append(f"smartd enabled but {smartd.get('active')} - the drives were "
+                   f"unwatched for some of this window")
+    elif smartd.get("messages"):
+        for line in smartd["messages"]:
+            out.append(f"smartd {line}")
+    else:
+        out.append("smartd active, nothing reported in the window")
 
     out.append("")
     if data["alerts"]:

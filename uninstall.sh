@@ -24,4 +24,13 @@ if [[ -e /etc/systemd/system/vitals-root.timer ]]; then
   "${SUDO[@]}" systemctl daemon-reload
 fi
 
+# smartd is a system package, not ours. Put its config back and leave the
+# daemon running - watching the drives is worth having with or without vitals.
+if [[ -e /etc/smartd.conf.before-vitals ]]; then
+  "${SUDO[@]}" mv /etc/smartd.conf.before-vitals /etc/smartd.conf
+  "${SUDO[@]}" systemctl reload smartd.service 2>/dev/null || true
+  echo "smartd.conf restored; smartd left running"
+fi
+"${SUDO[@]}" rm -f /usr/local/bin/vitals-smartd-notify
+
 echo "removed. state kept in ~/.local/state/vitals"

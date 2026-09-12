@@ -4,6 +4,8 @@ Records the handful of things that can take this desktop down, once a minute, so
 
 There is no web UI, no metrics database and no bar widget.
 
+A drive dying is the one thing that cannot wait for the morning, and that job belongs to `smartd`, which has been doing it since 2002. This script does not duplicate it.
+
 ## What it watches
 
 | Check | Fires when |
@@ -11,22 +13,20 @@ There is no web UI, no metrics database and no bar widget.
 | CPU idle floor | the median `Tccd2` across idle samples from the last 24h goes above 65C |
 | CPU hard limit | `Tctl` holds 89C for five minutes |
 | NVMe temperature | a drive passes its own warning or critical limit |
-| SMART | health fails, a critical warning is set, spare blocks hit the floor, media errors appear, or wear passes 90% |
+| SMART | media errors appear, or wear passes 90% |
 | Unsafe shutdowns | the drive's counter goes up |
 | Disk space | `/` above 85%, `/boot` above 80% |
 | GPU | 88C or 92C held for five minutes, or a fan reading 0% while the card is above 50C |
 | Kernel log | machine checks, or NVRM allocation failures |
+| smartd | it is enabled but not running, so nothing is watching the drives |
 
 ## What reaches the screen
 
-Almost nothing. The readings are the product and the thresholds below are evaluated quietly, so the day's evidence is on disk by morning rather than interrupting the afternoon.
+Nothing from this script. The readings are the product and the thresholds above are evaluated quietly, so the day's evidence is on disk by morning rather than interrupting the afternoon.
 
-Four conditions still put a notification up, because they mean the drive is going now rather than by Tuesday:
+One thing still puts a notification up, and it is `smartd`. Every half hour it reads the NVMe critical-warning byte and logs at `LOG_CRIT` if the drive has set a bit in it. Those bits are failed health, spare blocks at the drive's own floor, and a temperature past the drive's own critical limit — the cases where the drive is going now rather than by Tuesday. The drive is the one saying so, which is better than a script deriving the same verdict from the same byte.
 
-- SMART health reports FAILED
-- the drive raises an NVMe critical warning
-- spare blocks reach the drive's own floor
-- a drive passes its own critical temperature
+`smartd-notify` is the fifteen lines that carry that message to the desktop. `vitals report` says whether `smartd` was up and what it said, so a quiet morning can be told apart from a morning where nothing was looking.
 
 Everything else is written to the log and waits.
 
@@ -50,15 +50,23 @@ cd ~/Work/vitals
 
 Symlinks the script into `~/.local/bin` and enables a user timer. No root.
 
-SMART attributes need root to read, so they are a separate hourly system timer:
+The root half needs root, so it is separate. It adds an hourly timer that reads SMART attributes into a file, because `smartd` warns but keeps no history and the report wants the trend, and it points `smartd` at the notifier:
 
 ```sh
 ./install.sh --with-smart
 ```
 
-Until that one is installed, `vitals status` says SMART is unavailable and everything else works normally.
+That writes one line to `/etc/smartd.conf`, keeping a copy of the original next to it:
 
-`./uninstall.sh` takes both halves back off and leaves the collected samples alone.
+```
+DEVICESCAN -H -l error -m <nomailer> -M daily -M exec /usr/local/bin/vitals-smartd-notify
+```
+
+`-H` is the critical-warning check. `<nomailer>` means run the script instead of sending mail, and `daily` re-warns once a day for as long as the drive is still complaining.
+
+Until that runs, `vitals status` says SMART is unavailable and no drive is being watched between reports. Everything else works normally.
+
+`./uninstall.sh` takes both halves back off, puts `/etc/smartd.conf` back as it found it and leaves `smartd` running, because watching the drives is worth having with or without this script. Collected samples are left alone.
 
 ## Use
 
@@ -82,6 +90,7 @@ disk   /boot  20% used, 1.6G free
 smart  Samsung SSD 980 PRO 1TB: PASSED, 7% used, spare 100%, 0 media errors, 88 unsafe shutdowns
 smart  Samsung SSD 990 EVO Plus 2TB: PASSED, 0% used, spare 100%, 0 media errors, 8 unsafe shutdowns
        (read 0.0h ago)
+smartd active - watching for a critical warning
 
 nothing firing
 ```
@@ -105,7 +114,9 @@ A broken config file is ignored with a complaint rather than taking the monitor 
 
 ## Notes and limitations
 
-The four emergencies go to the desktop and nowhere else. Everything leaves through one `deliver()` function, so ntfy or email is a small change if that stops being true.
+Nothing in this script reaches the screen any more. `deliver()` is still the one place an alert leaves the process, so ntfy or email is a small change if that stops being true.
+
+`smartd` is the only piece taken off the shelf, and it earns it: the four alerts it replaced were all reading the same critical-warning byte it reads. The rest was left alone on purpose. Prometheus and node_exporter would cover the temperatures and the disks, and Netdata would cover them with one install, but both answer by drawing a graph, and a graph has to be looked at. The idle floor below has no off-the-shelf equivalent at all.
 
 Sensor 1 and Sensor 2 on both drives report no usable limits, only the sentinel value that means none was set, so `Composite` is the only sensor ever judged against a threshold. The 990 EVO Plus runs hottest on Sensor 1. Every sensor is in the report regardless, which is now where the judgement happens.
 

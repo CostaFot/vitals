@@ -8,16 +8,22 @@ Read the `board` skill before touching any of it.
 
 ## Shape
 
-One Python file, `vitals`, stdlib only, no dependencies. Two systemd timers:
+One Python file, `vitals`, stdlib only, no dependencies. Two systemd timers and
+one daemon that is not ours:
 
 - `vitals.timer` (user, every minute) runs `vitals check`. Does all the probing,
-  thresholding, alerting and sample recording. Needs no privileges.
+  thresholding and sample recording. Needs no privileges. Notifies nobody.
 - `vitals-root.timer` (system, hourly) runs `vitals root-probe`. Exists only
   because NVMe SMART attributes need root. It does no thresholding — it dumps
   facts to `/var/lib/vitals/root.json` (0644) and the user half decides what they
   mean. Keeping all judgement in one place is deliberate.
+- `smartd` (system package) owns the drive emergencies. `-H` reads the NVMe
+  critical-warning byte every 30 minutes and logs `LOG_CRIT` if any bit is set.
+  `-M exec` runs `smartd-notify`, the only thing here that puts anything on screen.
 
 `install.sh` symlinks rather than copies, so editing the repo changes what runs.
+It rewrites the `DEVICESCAN` line in `/etc/smartd.conf` and keeps the original at
+`/etc/smartd.conf.before-vitals`, which `uninstall.sh` puts back.
 
 ## State
 
@@ -40,9 +46,12 @@ Two flags on `Alert` decide what happens to it, and both are carried through
 
 - `event` - it happened rather than being true now (machine checks, NVRM
   failures, unsafe shutdowns, media errors). Fires once, no recovery notice.
-- `emergency` - it is allowed to reach the desktop. Four alerts set it: SMART
-  health, NVMe critical warning, spare exhausted, drive at its critical
-  temperature. Everything else is logged silently and read back by `report`.
+- `emergency` - it is allowed to reach the desktop. **Nothing sets it.** The four
+  alerts that used to were SMART health, NVMe critical warning, spare exhausted
+  and drive-at-critical-temperature, all bits in the same NVMe critical-warning
+  byte that `smartd -H` reads directly. The flag and the notify branch in
+  `deliver()` stay because that is where a future non-drive emergency would land
+  — the GPU fan is the live candidate (COS-189).
 
 ## Things that are easy to get wrong
 
@@ -59,6 +68,13 @@ around 47C while Sensor 1 is at 65C. `check_drive_temps` walks every sensor,
 but only `Composite` reports usable limits on either drive, so Sensor 1 has
 nothing to be judged against and never alerts. It is in `readings.csv` and in
 `vitals report`, which is where it actually gets looked at.
+
+**smartd-notify writes to the journal with no unit attached.** smartd forks the
+`-M exec` target outside its own cgroup, so those lines have no `_SYSTEMD_UNIT`
+and `journalctl -u smartd.service` silently misses them. `smartd_messages()`
+therefore ORs two matches with `+`: `_SYSTEMD_UNIT=smartd.service` for smartd's
+own `LOG_CRIT`, and `SYSLOG_IDENTIFIER=vitals-smartd` for the script's. Dropping
+either one makes the report claim a quiet night that was not observed.
 
 **Journal cursor seeding.** `journalctl` only writes `--cursor-file` for entries
 it actually printed, so `--since=now` leaves the cursor unset and the next run
@@ -86,6 +102,19 @@ vitals log
 
 `vitals check --quiet` evaluates and records without notifying.
 
+smartd has its own end-to-end test, which runs the real `-M exec` path and puts a
+real toast on screen, one per drive:
+
+```sh
+sudo sed -i 's|-M daily|-M daily -M test|' /etc/smartd.conf
+sudo systemctl restart smartd.service      # two notifications appear
+sudo sed -i 's| -M test||' /etc/smartd.conf
+sudo systemctl restart smartd.service
+```
+
+Stopping `smartd.service` and running `vitals check` exercises the `smartd_down`
+alert; starting it again clears it.
+
 ## Deliberately not here
 
 Fan and pump RPM via `it87-dkms`: needs `acpi_enforce_resources=lax` as a kernel
@@ -94,3 +123,11 @@ COS-183. Do not re-propose it.
 
 Remote alert delivery: decided against for now, the machine is attended. If it
 comes back, `deliver()` is the only function that needs to change.
+
+Prometheus with node_exporter, or Netdata: considered properly on COS-188 and
+turned down. Both would cover the temperatures, the disks and the GPU, and
+Prometheus can even express the idle floor as a subquery. Both answer by drawing
+a graph, and the whole reason this exists is that the graphs never get looked at.
+smartd was taken because it replaced four alerts that were reading the same byte
+it reads. Do not re-propose the rest without a reason that is not "it is
+standard".
