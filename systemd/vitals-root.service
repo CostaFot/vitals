@@ -1,6 +1,6 @@
 [Unit]
 Description=Read NVMe SMART attributes for vitals
-Documentation=https://linear.app/costafotiadis/issue/COS-183
+Documentation=https://www.costafotiadis.com/board/
 
 [Service]
 Type=oneshot

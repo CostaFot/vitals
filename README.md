@@ -26,7 +26,7 @@ NVRM allocation failures are in there because they are what the GPU says just be
 ## Install
 
 ```sh
-git clone <this repo> ~/Work/vitals
+git clone https://github.com/CostaFot/vitals.git ~/Work/vitals
 cd ~/Work/vitals
 ./install.sh
 ```
