@@ -9,7 +9,8 @@ Read the `board` skill before touching any of it.
 ## Shape
 
 One Python file, `vitals`, stdlib only, no dependencies. Two systemd timers and
-one daemon that is not ours:
+one daemon that is not ours do the watching; a scheduled agent does the reading
+(see The morning read below):
 
 - `vitals.timer` (user, every minute) runs `vitals check`. Does all the probing,
   thresholding and sample recording. Needs no privileges. Notifies nobody.
@@ -37,6 +38,7 @@ Everything lives in `~/.local/state/vitals/`:
 | `alerts.json` | currently firing alerts, plus `_smart_counters` for detecting a rising unsafe-shutdown count |
 | `alerts.jsonl` | append-only log of every fire and clear |
 | `journal.cursor` | journalctl cursor, so each run only sees new kernel lines |
+| `report.cursor` | where the last `vitals report --since-last` stopped, so the morning read never sees a window twice nor leaves a hole |
 
 Keys in `alerts.json` that start with `_` are internal bookkeeping, not alerts;
 the dispatch loop skips them when deciding what has recovered.
@@ -52,6 +54,27 @@ Two flags on `Alert` decide what happens to it, and both are carried through
   byte that `smartd -H` reads directly. The flag and the notify branch in
   `deliver()` stay because that is where a future non-drive emergency would land
   — the GPU fan is the live candidate (COS-189).
+
+## The morning read
+
+vitals judges almost nothing and notifies nobody. The judgement is a BB
+automation, `auto__tpv6vzfspe` on the `vitals` project: 12:00 Europe/Athens,
+Sonnet 5, one command, and silence unless something is worth saying. Its prompt
+carries the reading rules - that a high max means nothing on chips designed to
+boost into their limit but a high median does, that the idle floor is the pump
+proxy, that `Sensor 1` has no limit to be judged against, and that a stopped
+smartd reads exactly like a clean night. Change the rules there, not here:
+
+```sh
+bb automation show auto__tpv6vzfspe --project proj_dtsyy954sc
+bb automation runs auto__tpv6vzfspe --project proj_dtsyy954sc
+```
+
+`--since-last` is what makes a missed run harmless. The window runs from the
+previous marked report to now rather than a fixed 24 hours, so a day the machine
+slept through gets picked up by the next run instead of falling in a hole. The
+mark moves when the report prints, so running it by hand takes that window away
+from the automation - use `--hours` to look around.
 
 ## Things that are easy to get wrong
 

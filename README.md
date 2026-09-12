@@ -95,7 +95,7 @@ smartd active - watching for a critical warning
 nothing firing
 ```
 
-`vitals report` defaults to the last 24 hours and takes `--hours`. It prints min, median, p95 and max for every metric, the idle floor, each drive sensor against its limit, disk drift, the SMART counters with their deltas, and any gaps in sampling, which are how you tell the machine was asleep rather than cold. `--json` for something that has to parse it.
+`vitals report` defaults to the last 24 hours and takes `--hours`. It prints min, median, p95 and max for every metric, the idle floor, each drive sensor against its limit, disk drift, the SMART counters with their deltas, and any gaps in sampling, which are how you tell the machine was asleep rather than cold. `--json` for something that has to parse it. `--since-last` starts from where the last marked report stopped and moves the mark. A day the machine slept through then lands in the next read instead of in a hole.
 
 ## Configuration
 

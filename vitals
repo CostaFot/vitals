@@ -30,6 +30,7 @@ SMART_LOG = STATE_DIR / "smart.jsonl"
 ALERT_STATE = STATE_DIR / "alerts.json"
 ALERT_LOG = STATE_DIR / "alerts.jsonl"
 CURSOR = STATE_DIR / "journal.cursor"
+REPORT_CURSOR = STATE_DIR / "report.cursor"
 CONFIG_FILE = XDG_CONFIG / "vitals/config.toml"
 
 ROOT_FACTS = Path("/var/lib/vitals/root.json")
@@ -1103,7 +1104,10 @@ def _clock(ts: float) -> str:
 
 
 def render_report(data: dict) -> str:
-    out = [f"vitals report  last {data['window_hours']:g}h  "
+    hours = data["window_hours"]
+    window = (f"{hours * 60:.0f}m" if hours < 1
+              else f"{hours:.1f}".rstrip("0").rstrip(".") + "h")
+    out = [f"vitals report  last {window}  "
            f"({_clock(data['since'])} -> {_clock(data['generated'])})", ""]
 
     cov = data["coverage"]
@@ -1175,9 +1179,35 @@ def render_report(data: dict) -> str:
     return "\n".join(out)
 
 
+def window_since_last(default: float) -> tuple[float, str]:
+    """The morning read wants everything since the *last* morning read, not a
+    fixed day. A run that is late, or one the machine slept through, must not
+    leave a hole in what was looked at."""
+    try:
+        last = float(REPORT_CURSOR.read_text().strip())
+    except (OSError, ValueError):
+        return default, "default"
+    # Round up to the next whole minute so the window cannot end just short of
+    # a sample the previous run also missed.
+    minutes = int((time.time() - last) / 60) + 1
+    if minutes <= 0:                        # clock moved backwards
+        return default, "default"
+    cap = CONFIG["sample_retention_days"] * 24
+    if minutes / 60 > cap:                  # older than that is trimmed anyway
+        return cap, "retention-cap"
+    return minutes / 60, "last-report"
+
+
 def cmd_report(args: argparse.Namespace) -> int:
-    data = report_data(args.hours)
+    hours, source = args.hours, "hours"
+    if args.since_last:
+        hours, source = window_since_last(args.hours)
+    data = report_data(hours)
+    data["since_source"] = source
     print(json.dumps(data, indent=2) if args.json else render_report(data))
+    if args.since_last:
+        REPORT_CURSOR.parent.mkdir(parents=True, exist_ok=True)
+        REPORT_CURSOR.write_text(f"{data['generated']:.0f}\n")
     return 0
 
 
@@ -1204,6 +1234,9 @@ def main() -> int:
     report = sub.add_parser("report", help="summarise a window for the morning read")
     report.add_argument("--hours", type=float, default=24.0,
                         help="how far back to look (default 24)")
+    report.add_argument("--since-last", action="store_true",
+                        help="look back to the last --since-last report instead, "
+                             "and record this one as the new mark")
     report.add_argument("--json", action="store_true", help="machine readable")
     report.set_defaults(func=cmd_report)
 
