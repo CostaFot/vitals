@@ -43,11 +43,17 @@ CONFIG: dict = {
     "idle_window_hours": 24,
     "idle_min_samples": 30,        # don't judge the floor on thin data
     "idle_floor_warn": 65.0,       # median idle Tccd2 above this = alert
-    "cpu_tctl_crit": 85.0,         # near throttle, alert regardless of load
+    # 5900X Tjmax is 90C and it boosts into it on purpose. Only a sustained
+    # sit at the ceiling means something is wrong with the cooling.
+    "cpu_tctl_crit": 89.0,
 
-    "gpu_temp_warn": 80.0,
-    "gpu_temp_crit": 88.0,
+    # Both chips are designed to run at their limit under load, so these sit
+    # just below the hardware's own numbers and only count when sustained.
+    # RTX 3080: max operating 93C, slowdown 95C, shutdown 98C.
+    "gpu_temp_warn": 88.0,
+    "gpu_temp_crit": 92.0,
     "gpu_fan_stall_temp": 50.0,    # 0% fan while this warm = fan failure
+    "sustained_minutes": 5,        # a gaming session is not an emergency
 
     "disk_warn_pct": 85.0,
     "disk_crit_pct": 93.0,
@@ -318,6 +324,36 @@ def idle_samples() -> list[float]:
     return out
 
 
+def sustained(column: int, threshold: float, minutes: int) -> bool:
+    """True when every sample in the last `minutes` was above `threshold`.
+
+    Both the CPU and the GPU are meant to sit near their limits under load,
+    so a single hot reading says nothing. Staying there does.
+    """
+    if not SAMPLES.exists():
+        return False
+    cutoff = time.time() - minutes * 60
+    recent = []
+    for row in SAMPLES.read_text().splitlines()[1:]:
+        parts = row.split(",")
+        if len(parts) <= column:
+            continue
+        try:
+            ts, value = float(parts[0]), float(parts[column])
+        except ValueError:
+            continue
+        if ts >= cutoff:
+            recent.append(value)
+    # Needs a full window; a fresh install must not alert off two samples.
+    if len(recent) < minutes:
+        return False
+    return all(value >= threshold for value in recent)
+
+
+TCTL_COLUMN = 2
+GPU_TEMP_COLUMN = 5
+
+
 def median(values: list[float]) -> float:
     ordered = sorted(values)
     mid = len(ordered) // 2
@@ -361,10 +397,12 @@ def check_cpu(snap: dict) -> list[Alert]:
     cpu = snap["sensors"].get("cpu", {})
     tctl = cpu.get("Tctl")
 
-    if tctl is not None and tctl >= CONFIG["cpu_tctl_crit"]:
+    window = CONFIG["sustained_minutes"]
+    if tctl is not None and sustained(TCTL_COLUMN, CONFIG["cpu_tctl_crit"], window):
         out.append(Alert(
-            "cpu_tctl", "crit", "CPU near throttle",
-            f"Tctl {tctl:.1f}C (limit {CONFIG['cpu_tctl_crit']:.0f}C)",
+            "cpu_tctl", "crit", "CPU has been sitting at its thermal limit",
+            f"Tctl {tctl:.1f}C for {window} minutes "
+            f"(limit {CONFIG['cpu_tctl_crit']:.0f}C)",
             {"tctl": tctl, "load1": snap["load1"]},
         ))
 
@@ -411,15 +449,17 @@ def check_gpu(snap: dict) -> list[Alert]:
     if temp is None:
         return out
 
-    if temp >= CONFIG["gpu_temp_crit"]:
+    window = CONFIG["sustained_minutes"]
+    name = gpu.get("name", "GPU")
+    if sustained(GPU_TEMP_COLUMN, CONFIG["gpu_temp_crit"], window):
         out.append(Alert(
-            "gpu_temp", "crit", "GPU is critically hot",
-            f"{gpu.get('name', 'GPU')} at {temp:.0f}C", {"temp": temp},
+            "gpu_temp", "crit", "GPU is at its operating limit",
+            f"{name} at {temp:.0f}C for {window} minutes", {"temp": temp},
         ))
-    elif temp >= CONFIG["gpu_temp_warn"]:
+    elif sustained(GPU_TEMP_COLUMN, CONFIG["gpu_temp_warn"], window):
         out.append(Alert(
             "gpu_temp", "warn", "GPU is running hot",
-            f"{gpu.get('name', 'GPU')} at {temp:.0f}C", {"temp": temp},
+            f"{name} at {temp:.0f}C for {window} minutes", {"temp": temp},
         ))
 
     if fan is not None and fan == 0 and temp >= CONFIG["gpu_fan_stall_temp"]:
