@@ -53,15 +53,17 @@ vitals probe     # raw readings as JSON
 ```
 
 ```
-load   0.84
-cpu    Tccd1 76.0C  Tccd2 47.2C  Tctl 58.2C
-       idle floor: Tccd2 median 51.5C over 412 samples, limit 65C [OK]
-gpu    NVIDIA GeForce RTX 3080  43C  fan 47%  26W  1009/12288 MiB
-drive  Samsung SSD 980 PRO 1TB: Composite 49.9C  Sensor 1 49.9C  Sensor 2 56.9C  (warn 82C)
+load   0.68
+cpu    Tccd1 65.2C  Tccd2 47.0C  Tctl 61.4C
+       idle floor: not enough idle samples yet (16/30)
+gpu    NVIDIA GeForce RTX 3080  44C  fan 47%  29W  1093/12288 MiB
+drive  Samsung SSD 980 PRO 1TB: Composite 49.9C  Sensor 1 49.9C  Sensor 2 57.9C  (warn 82C)
 drive  Samsung SSD 990 EVO Plus 2TB: Composite 46.9C  Sensor 1 64.8C  Sensor 2 46.9C  (warn 81C)
 disk   /  20% used, 1482.0G free
 disk   /boot  20% used, 1.6G free
 smart  Samsung SSD 980 PRO 1TB: PASSED, 7% used, spare 100%, 0 media errors, 88 unsafe shutdowns
+smart  Samsung SSD 990 EVO Plus 2TB: PASSED, 0% used, spare 100%, 0 media errors, 8 unsafe shutdowns
+       (read 0.0h ago)
 
 nothing firing
 ```

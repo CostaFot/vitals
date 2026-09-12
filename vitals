@@ -624,14 +624,17 @@ def dispatch(alerts: list[Alert], quiet: bool = False) -> None:
         due = not previous or escalated or (
             now - previous.get("last_sent", 0) >= cooldown_seconds(alert.severity)
         )
-        if due and not quiet:
+        sent = due and not quiet
+        if sent:
             deliver(alert)
         state[key] = {
             "severity": alert.severity,
             "title": alert.title,
             "body": alert.body,
             "since": (previous or {}).get("since", now),
-            "last_sent": now if due else (previous or {}).get("last_sent", 0),
+            # Only a delivered alert starts the cooldown, so a --quiet run
+            # cannot silence the next real one.
+            "last_sent": now if sent else (previous or {}).get("last_sent", 0),
         }
 
     for key in [k for k in state if not k.startswith("_") and k not in firing]:

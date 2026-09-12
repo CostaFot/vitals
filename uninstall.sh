@@ -3,18 +3,25 @@
 # and the alert log in ~/.local/state/vitals alone.
 set -euo pipefail
 
+# Without a terminal to type into (running under an agent, or from a hotkey)
+# sudo needs an askpass helper to put the prompt on screen.
+SUDO=(sudo)
+if [[ -n "${SUDO_ASKPASS:-}" && ! -t 0 ]]; then
+  SUDO=(sudo -A)
+fi
+
 systemctl --user disable --now vitals.timer 2>/dev/null || true
 rm -f ~/.config/systemd/user/vitals.service ~/.config/systemd/user/vitals.timer
 rm -f ~/.local/bin/vitals
 systemctl --user daemon-reload
 
 if [[ -e /etc/systemd/system/vitals-root.timer ]]; then
-  sudo systemctl disable --now vitals-root.timer 2>/dev/null || true
-  sudo rm -f /etc/systemd/system/vitals-root.service \
+  "${SUDO[@]}" systemctl disable --now vitals-root.timer 2>/dev/null || true
+  "${SUDO[@]}" rm -f /etc/systemd/system/vitals-root.service \
              /etc/systemd/system/vitals-root.timer \
              /usr/local/bin/vitals
-  sudo rm -rf /var/lib/vitals
-  sudo systemctl daemon-reload
+  "${SUDO[@]}" rm -rf /var/lib/vitals
+  "${SUDO[@]}" systemctl daemon-reload
 fi
 
 echo "removed. state kept in ~/.local/state/vitals"
