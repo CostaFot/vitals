@@ -56,6 +56,7 @@ CONFIG: dict = {
     "gpu_temp_warn": 88.0,
     "gpu_temp_crit": 92.0,
     "gpu_fan_stall_temp": 50.0,    # 0% fan while this warm = fan failure
+    "gpu_fan_confirm_minutes": 2,  # ...and still 0% this long later
     "sustained_minutes": 5,        # a gaming session is not an emergency
 
     "disk_warn_pct": 85.0,
@@ -444,8 +445,36 @@ def sustained(column: int, threshold: float, minutes: int) -> bool:
     return all(value >= threshold for value in recent)
 
 
+def fan_stopped(minutes: int) -> bool:
+    """True when every sample in the last `minutes` read the GPU fan at 0%.
+
+    The 3080 stops its fan below roughly 45C on purpose, so a 0% reading is
+    normal and says nothing on its own; a driver hiccup can produce one at any
+    temperature. Still 0% a minute later, with the card above the stall
+    temperature, is a fan that is not coming back.
+    """
+    if not SAMPLES.exists():
+        return False
+    cutoff = time.time() - minutes * 60
+    recent = []
+    for row in SAMPLES.read_text().splitlines()[1:]:
+        parts = row.split(",")
+        if len(parts) <= GPU_FAN_COLUMN:
+            continue
+        try:
+            ts, value = float(parts[0]), float(parts[GPU_FAN_COLUMN])
+        except ValueError:
+            continue
+        if ts >= cutoff:
+            recent.append(value)
+    if len(recent) < minutes:
+        return False
+    return all(value == 0 for value in recent)
+
+
 TCTL_COLUMN = 2
 GPU_TEMP_COLUMN = 5
+GPU_FAN_COLUMN = 6
 
 
 def median(values: list[float]) -> float:
@@ -476,10 +505,10 @@ class Alert:
     # Event alerts record something that happened rather than a condition that
     # is still true. They fire once and leave without a recovery notice.
     event: bool = False
-    # Readings are the product; the log is read the next morning. Nothing sets
-    # this any more - the four alerts that used to were all NVMe critical-warning
-    # bits, and smartd reads that byte itself. The flag and the notify path in
-    # deliver() stay because they are where a future non-drive emergency lands.
+    # Readings are the product; the log is read at noon. One check sets this:
+    # a GPU fan that has stopped under load, which is the only failure here
+    # that gets worse on its own and that nothing else watches. The NVMe
+    # critical-warning bits that used to set it are smartd's now.
     emergency: bool = False
 
 
@@ -565,11 +594,19 @@ def check_gpu(snap: dict) -> list[Alert]:
             f"{name} at {temp:.0f}C for {window} minutes", {"temp": temp},
         ))
 
-    if fan is not None and fan == 0 and temp >= CONFIG["gpu_fan_stall_temp"]:
+    # The only check here that reaches the screen. Nothing else on this machine
+    # can get worse while nobody is looking: a hot chip throttles, a full disk
+    # waits, a failing drive is smartd's. A dead fan under load does not stop
+    # at 93C out of politeness, and the card cannot tell anyone itself.
+    confirm = CONFIG["gpu_fan_confirm_minutes"]
+    if (fan is not None and fan == 0
+            and temp >= CONFIG["gpu_fan_stall_temp"]
+            and fan_stopped(confirm)):
         out.append(Alert(
             "gpu_fan", "crit", "GPU fan is not spinning",
-            f"Fan at 0% while the GPU is {temp:.0f}C",
+            f"Fan at 0% for {confirm} minutes while the GPU is {temp:.0f}C",
             {"temp": temp, "fan": fan},
+            emergency=True,
         ))
     return out
 
@@ -737,9 +774,9 @@ def notify(title: str, body: str, severity: str, key: str) -> None:
 def deliver(alert: Alert, kind: str = "fire") -> None:
     """The one place alerts leave the process. Remote delivery hooks in here.
 
-    Everything is written to the log and nothing currently reaches the screen:
-    the drive emergencies moved to smartd, which notifies through smartd-notify.
-    The branch below stays because it is where a non-drive emergency would land.
+    Everything is written to the log, and one thing reaches the screen: a
+    stopped GPU fan. The drive emergencies are smartd's, which notifies
+    through smartd-notify. Everything else waits for the noon read.
     """
     if alert.emergency:
         if kind == "fire":

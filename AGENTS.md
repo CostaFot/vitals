@@ -13,14 +13,15 @@ one daemon that is not ours do the watching; a scheduled agent does the reading
 (see The morning read below):
 
 - `vitals.timer` (user, every minute) runs `vitals check`. Does all the probing,
-  thresholding and sample recording. Needs no privileges. Notifies nobody.
+  thresholding and sample recording. Needs no privileges. Notifies for one
+  thing only, a stopped GPU fan.
 - `vitals-root.timer` (system, hourly) runs `vitals root-probe`. Exists only
   because NVMe SMART attributes need root. It does no thresholding — it dumps
   facts to `/var/lib/vitals/root.json` (0644) and the user half decides what they
   mean. Keeping all judgement in one place is deliberate.
 - `smartd` (system package) owns the drive emergencies. `-H` reads the NVMe
   critical-warning byte every 30 minutes and logs `LOG_CRIT` if any bit is set.
-  `-M exec` runs `smartd-notify`, the only thing here that puts anything on screen.
+  `-M exec` runs `smartd-notify`, the other thing here that puts anything on screen.
 
 `install.sh` symlinks rather than copies, so editing the repo changes what runs.
 It rewrites the `DEVICESCAN` line in `/etc/smartd.conf` and keeps the original at
@@ -48,16 +49,24 @@ Two flags on `Alert` decide what happens to it, and both are carried through
 
 - `event` - it happened rather than being true now (machine checks, NVRM
   failures, unsafe shutdowns, media errors). Fires once, no recovery notice.
-- `emergency` - it is allowed to reach the desktop. **Nothing sets it.** The four
-  alerts that used to were SMART health, NVMe critical warning, spare exhausted
-  and drive-at-critical-temperature, all bits in the same NVMe critical-warning
-  byte that `smartd -H` reads directly. The flag and the notify branch in
-  `deliver()` stay because that is where a future non-drive emergency would land
-  — the GPU fan is the live candidate (COS-189).
+- `emergency` - it is allowed to reach the desktop. **One check sets it**: a GPU
+  fan reading 0% while the card is above 50C, confirmed across two samples a
+  minute apart. It is the only failure here that gets worse unattended and that
+  nothing else watches — chips throttle, disks wait, drives are smartd's. The
+  four alerts that used to set it were SMART health, NVMe critical warning,
+  spare exhausted and drive-at-critical-temperature, all bits in the same NVMe
+  critical-warning byte that `smartd -H` reads directly (COS-188, COS-189).
+
+  The two-sample confirm is the whole reason it can be trusted. A 3080 stops its
+  fan below roughly 45C on purpose — the samples caught this card doing it at
+  42-45C and spinning back up at 45C — so 0% on its own is normal, and the 50C
+  gate sits above the card's own restart point. `fan_stopped()` is deliberately
+  separate from `sustained()`, which tests for values *above* a threshold.
 
 ## The morning read
 
-vitals judges almost nothing and notifies nobody. The judgement is a BB
+vitals judges almost nothing and notifies for one thing. The rest of the
+judgement is a BB
 automation, `auto__tpv6vzfspe` on the `vitals` project: 12:00 Europe/Athens,
 Opus 5, one command, and silence unless something is worth saying. Its prompt
 carries the reading rules - that a high max means nothing on chips designed to
@@ -124,6 +133,27 @@ vitals log
 ```
 
 `vitals check --quiet` evaluates and records without notifying.
+
+The GPU fan alert is the one thing config cannot force, because it needs a real
+0% reading from `nvidia-smi` as well as a threshold. Point `SAMPLES` at a fake
+file and call the check directly:
+
+```sh
+python3 - <<'EOF'
+import importlib.machinery, importlib.util, pathlib, sys, tempfile, time
+loader = importlib.machinery.SourceFileLoader("v", "vitals")
+v = importlib.util.module_from_spec(importlib.util.spec_from_loader("v", loader))
+sys.modules["v"] = v; loader.exec_module(v)
+now, f = time.time(), pathlib.Path(tempfile.mkstemp(suffix=".csv")[1])
+f.write_text("ts,load1,tctl,tccd1,tccd2,gpu_temp,gpu_fan\n" + "".join(
+    f"{now-age},0.5,60,60,50,72,0\n" for age in (0, 60, 120)))
+v.SAMPLES = f
+print(v.check_gpu({"gpu": {"name": "RTX 3080", "temp": 72.0, "fan": 0.0}}))
+EOF
+```
+
+Change one of those `0` fan values to `47` and it must go silent — that is the
+driver-hiccup case the confirm exists for.
 
 smartd has its own end-to-end test, which runs the real `-M exec` path and puts a
 real toast on screen, one per drive:

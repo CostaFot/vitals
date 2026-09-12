@@ -22,9 +22,11 @@ A drive dying is the one thing that cannot wait for the morning, and that job be
 
 ## What reaches the screen
 
-Nothing from this script. The readings are the product and the thresholds above are evaluated quietly, so the day's evidence is on disk by morning rather than interrupting the afternoon.
+Two things, and a stopped GPU fan is one of them. Everything else here is evaluated quietly, so the day's evidence is on disk by noon rather than interrupting the afternoon.
 
-One thing still puts a notification up, and it is `smartd`. Every half hour it reads the NVMe critical-warning byte and logs at `LOG_CRIT` if the drive has set a bit in it. Those bits are failed health, spare blocks at the drive's own floor, and a temperature past the drive's own critical limit — the cases where the drive is going now rather than by Tuesday. The drive is the one saying so, which is better than a script deriving the same verdict from the same byte.
+The fan is the exception because it is the only failure on this machine that gets worse while nobody is looking. A hot chip throttles itself, a full disk waits, a dying drive is `smartd`'s. A 3080 with a dead fan under load climbs to its 95C slowdown and sits there, and the card cannot tell anyone. The alert needs 0% twice a minute apart while the card is above 50C — the fan idles at 0% below about 45C by design, so a single cool reading means nothing and a driver hiccup means nothing either.
+
+The other is `smartd`. Every half hour it reads the NVMe critical-warning byte and logs at `LOG_CRIT` if the drive has set a bit in it. Those bits are failed health, spare blocks at the drive's own floor, and a temperature past the drive's own critical limit — the cases where the drive is going now rather than by Tuesday. The drive is the one saying so, which is better than a script deriving the same verdict from the same byte.
 
 `smartd-notify` is the fifteen lines that carry that message to the desktop. `vitals report` says whether `smartd` was up and what it said, so a quiet morning can be told apart from a morning where nothing was looking.
 
@@ -114,7 +116,7 @@ A broken config file is ignored with a complaint rather than taking the monitor 
 
 ## Notes and limitations
 
-Nothing in this script reaches the screen any more. `deliver()` is still the one place an alert leaves the process, so ntfy or email is a small change if that stops being true.
+One check in this script reaches the screen. `deliver()` is still the one place an alert leaves the process, so ntfy or email is a small change if the desktop stops being where you are.
 
 `smartd` is the only piece taken off the shelf, and it earns it: the four alerts it replaced were all reading the same critical-warning byte it reads. The rest was left alone on purpose. Prometheus and node_exporter would cover the temperatures and the disks, and Netdata would cover them with one install, but both answer by drawing a graph, and a graph has to be looked at. The idle floor below has no off-the-shelf equivalent at all.
 
