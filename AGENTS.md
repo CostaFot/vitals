@@ -59,7 +59,7 @@ Two flags on `Alert` decide what happens to it, and both are carried through
 
 vitals judges almost nothing and notifies nobody. The judgement is a BB
 automation, `auto__tpv6vzfspe` on the `vitals` project: 12:00 Europe/Athens,
-Sonnet 5, one command, and silence unless something is worth saying. Its prompt
+Opus 5, one command, and silence unless something is worth saying. Its prompt
 carries the reading rules - that a high max means nothing on chips designed to
 boost into their limit but a high median does, that the idle floor is the pump
 proxy, that `Sensor 1` has no limit to be judged against, and that a stopped
