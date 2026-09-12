@@ -9,15 +9,19 @@ There is no web UI, no metrics database and no bar widget.
 | Check | Fires when |
 |---|---|
 | CPU idle floor | the median `Tccd2` across idle samples from the last 24h goes above 65C |
-| CPU hard limit | `Tctl` hits 85C, whatever the load is doing |
+| CPU hard limit | `Tctl` holds 89C for five minutes |
 | NVMe temperature | a drive passes its own warning or critical limit |
 | SMART | health fails, a critical warning is set, spare blocks hit the floor, media errors appear, or wear passes 90% |
 | Unsafe shutdowns | the drive's counter goes up |
 | Disk space | `/` above 85%, `/boot` above 80% |
-| GPU | 80C, 88C, or a fan reading 0% while the card is above 50C |
+| GPU | 88C or 92C held for five minutes, or a fan reading 0% while the card is above 50C |
 | Kernel log | machine checks, or NVRM allocation failures |
 
 The idle floor is the one worth explaining. The AIO sits on a board header and the IT8688E chip on this motherboard has no driver bound, so `sensors` reports no pump RPM at all — if the pump weakens, nothing says so. What does change is the temperature the CPU settles at when nothing is happening. So only the samples taken while the load average was low are kept, and the median of those is what gets watched.
+
+Both chips are built to run at their limits, so one hot reading means nothing. The 3080's max operating temperature is 93C and the 5900X boosts into its 90C Tjmax on purpose, so the CPU and GPU numbers only fire when every sample in a five minute window sits above the line.
+
+A fan at 0% is judged on the spot, because a stopped fan is not a trend.
 
 Drive limits are not in the config. Each NVMe reports its own `temp1_max` and `temp1_crit`, so the 990 EVO Plus is judged at 81C and the 980 PRO at 82C without either number being written down anywhere.
 
@@ -73,10 +77,10 @@ nothing firing
 Optional. Anything in `~/.config/vitals/config.toml` overrides the defaults:
 
 ```toml
-idle_floor_warn = 62.0      # median idle Tccd2 that counts as a problem
+idle_floor_warn = 65.0      # median idle Tccd2 that counts as a problem
 idle_load_max = 1.0         # load1 below this counts as idle
-cpu_tctl_crit = 85.0
-gpu_temp_warn = 80.0
+cpu_tctl_crit = 89.0
+gpu_temp_warn = 88.0
 disk_warn_pct = 85.0
 cooldown_warn_hours = 6     # how long before the same warning nags again
 ```
