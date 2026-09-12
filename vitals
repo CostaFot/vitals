@@ -1,0 +1,825 @@
+#!/usr/bin/env python3
+"""vitals - watch the things that can take this desktop down.
+
+Runs as a user systemd timer once a minute. Everything it needs is readable
+without root except NVMe SMART attributes, which a separate hourly root timer
+drops into a JSON file for this script to read.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+# --- paths -------------------------------------------------------------------
+
+XDG_STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+
+STATE_DIR = XDG_STATE / "vitals"
+SAMPLES = STATE_DIR / "samples.csv"
+ALERT_STATE = STATE_DIR / "alerts.json"
+ALERT_LOG = STATE_DIR / "alerts.jsonl"
+CURSOR = STATE_DIR / "journal.cursor"
+CONFIG_FILE = XDG_CONFIG / "vitals/config.toml"
+
+ROOT_FACTS = Path("/var/lib/vitals/root.json")
+
+# --- config ------------------------------------------------------------------
+# Baselines measured 2026-09-12 on this machine and recorded in COS-183.
+# Override any of these in ~/.config/vitals/config.toml.
+
+CONFIG: dict = {
+    # The AIO has no readable pump RPM, so a rising *idle* CPU floor is the
+    # only early warning of a weakening pump. Baseline: Tccd2 idles 49-56C.
+    "idle_load_max": 1.0,          # load1 below this counts as idle
+    "idle_window_hours": 24,
+    "idle_min_samples": 30,        # don't judge the floor on thin data
+    "idle_floor_warn": 65.0,       # median idle Tccd2 above this = alert
+    "cpu_tctl_crit": 85.0,         # near throttle, alert regardless of load
+
+    "gpu_temp_warn": 80.0,
+    "gpu_temp_crit": 88.0,
+    "gpu_fan_stall_temp": 50.0,    # 0% fan while this warm = fan failure
+
+    "disk_warn_pct": 85.0,
+    "disk_crit_pct": 93.0,
+    "boot_warn_pct": 80.0,
+
+    "smart_percentage_used_warn": 90,
+    "smart_stale_hours": 6,        # root facts older than this = stale
+
+    "sample_retention_days": 30,
+    "cooldown_warn_hours": 6,
+    "cooldown_crit_hours": 1,
+}
+
+
+def load_config() -> None:
+    if not CONFIG_FILE.exists():
+        return
+    try:
+        import tomllib
+        with CONFIG_FILE.open("rb") as fh:
+            CONFIG.update(tomllib.load(fh))
+    except Exception as exc:  # a broken config must not blind the monitor
+        print(f"vitals: ignoring {CONFIG_FILE}: {exc}", file=sys.stderr)
+
+
+# --- probes ------------------------------------------------------------------
+
+
+def run(cmd: list[str], timeout: int = 15) -> str | None:
+    try:
+        out = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+def nvme_chip_map() -> dict[str, str]:
+    """sensors chip name -> drive model, via the PCI address in the chip name."""
+    out = {}
+    for dev in sorted(Path("/sys/class/nvme").glob("nvme*")):
+        try:
+            pci = (dev / "device").resolve().name          # 0000:01:00.0
+            model = (dev / "model").read_text().strip()
+        except OSError:
+            continue
+        # lm-sensors names the chip nvme-pci-BBSF: bus byte, then device
+        # and function packed into the next byte. 0000:01:00.0 -> 0100.
+        try:
+            _, bus, devfn = pci.split(":")
+            device, function = devfn.split(".")
+            packed = (int(device, 16) << 3) | int(function)
+        except ValueError:
+            continue
+        out[f"nvme-pci-{int(bus, 16):02x}{packed:02x}"] = model
+    return out
+
+
+def read_sensors() -> dict:
+    """CPU and NVMe temperatures. Each drive carries its own limits."""
+    raw = run(["sensors", "-j"])
+    if not raw:
+        return {}
+    try:
+        chips = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+
+    result: dict = {"cpu": {}, "drives": {}}
+    models = nvme_chip_map()
+
+    for chip, readings in chips.items():
+        if chip.startswith("k10temp"):
+            for label, vals in readings.items():
+                if not isinstance(vals, dict):
+                    continue
+                for key, value in vals.items():
+                    if key.endswith("_input"):
+                        result["cpu"][label] = value
+        elif chip.startswith("nvme-pci-"):
+            sensors: dict = {}
+            limits: dict = {}
+            for label, vals in readings.items():
+                if not isinstance(vals, dict):
+                    continue
+                for key, value in vals.items():
+                    if key.endswith("_input"):
+                        sensors[label] = value
+                    elif key.endswith("_max") and value < 1000:  # some read 65261
+                        limits.setdefault(label, {})["max"] = value
+                    elif key.endswith("_crit") and value < 1000:
+                        limits.setdefault(label, {})["crit"] = value
+            result["drives"][chip] = {
+                "model": models.get(chip, chip),
+                "temps": sensors,
+                "limits": limits,
+            }
+    return result
+
+
+def read_gpu() -> dict:
+    raw = run([
+        "nvidia-smi",
+        "--query-gpu=name,temperature.gpu,fan.speed,power.draw,memory.used,memory.total",
+        "--format=csv,noheader,nounits",
+    ])
+    if not raw or not raw.strip():
+        return {}
+    parts = [p.strip() for p in raw.strip().splitlines()[0].split(",")]
+    if len(parts) < 6:
+        return {}
+
+    def num(value: str) -> float | None:
+        try:
+            return float(value)
+        except ValueError:
+            return None
+
+    return {
+        "name": parts[0],
+        "temp": num(parts[1]),
+        "fan": num(parts[2]),
+        "power": num(parts[3]),
+        "mem_used": num(parts[4]),
+        "mem_total": num(parts[5]),
+    }
+
+
+def read_disks() -> dict:
+    out = {}
+    for path in ("/", "/boot"):
+        try:
+            usage = shutil.disk_usage(path)
+        except OSError:
+            continue
+        out[path] = {
+            "total": usage.total,
+            "used": usage.used,
+            "free": usage.free,
+            "pct": usage.used / usage.total * 100 if usage.total else 0.0,
+        }
+    return out
+
+
+def read_load() -> float:
+    return os.getloadavg()[0]
+
+
+# Benign: the kernel says this once at boot to announce the decoder exists.
+JOURNAL_IGNORE = ("In-kernel MCE decoding enabled",)
+
+JOURNAL_PATTERNS = {
+    "mce": ("machine check", "mce: [hardware error]", "hardware error"),
+    # BAR1 exhaustion: the GPU runs out of mappable VA and Brave's media
+    # thread dies with it. See the NVIDIA BAR1 notes in COS-183's neighbours.
+    "nvrm_oom": ("nv_err_no_memory", "nvassertokfailed"),
+}
+
+
+def read_journal() -> dict[str, list[str]]:
+    """Kernel hardware errors since the last run, using a journalctl cursor."""
+    CURSOR.parent.mkdir(parents=True, exist_ok=True)
+    first_run = not CURSOR.exists()
+    cmd = ["journalctl", "-k", "-o", "cat", "--no-pager", f"--cursor-file={CURSOR}"]
+    if first_run:
+        # Seed the cursor at the newest line rather than alerting on the
+        # whole backlog. journalctl only writes the cursor for lines it shows,
+        # so this has to show one.
+        cmd += ["-n", "1"]
+    raw = run(cmd, timeout=30)
+    if raw is None or first_run:
+        return {}
+
+    hits: dict[str, list[str]] = {}
+    for line in raw.splitlines():
+        low = line.lower()
+        if any(skip.lower() in low for skip in JOURNAL_IGNORE):
+            continue
+        for key, needles in JOURNAL_PATTERNS.items():
+            if any(needle in low for needle in needles):
+                hits.setdefault(key, []).append(line.strip())
+                break
+    return hits
+
+
+def read_root_facts() -> dict:
+    """SMART attributes dropped by the hourly root timer, if it is installed."""
+    try:
+        facts = json.loads(ROOT_FACTS.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    facts["age_hours"] = (time.time() - facts.get("ts", 0)) / 3600
+    return facts
+
+
+def probe() -> dict:
+    return {
+        "ts": time.time(),
+        "load1": read_load(),
+        "sensors": read_sensors(),
+        "gpu": read_gpu(),
+        "disks": read_disks(),
+        "root": read_root_facts(),
+    }
+
+
+# --- samples and the idle floor ----------------------------------------------
+
+
+def record_sample(snap: dict) -> None:
+    cpu = snap["sensors"].get("cpu", {})
+    gpu = snap.get("gpu", {})
+    row = [
+        f"{snap['ts']:.0f}",
+        f"{snap['load1']:.2f}",
+        f"{cpu.get('Tctl', '')}",
+        f"{cpu.get('Tccd1', '')}",
+        f"{cpu.get('Tccd2', '')}",
+        f"{gpu.get('temp', '')}",
+        f"{gpu.get('fan', '')}",
+    ]
+    SAMPLES.parent.mkdir(parents=True, exist_ok=True)
+    new = not SAMPLES.exists()
+    with SAMPLES.open("a") as fh:
+        if new:
+            fh.write("ts,load1,tctl,tccd1,tccd2,gpu_temp,gpu_fan\n")
+        fh.write(",".join(row) + "\n")
+    trim_samples()
+
+
+def trim_samples() -> None:
+    if not SAMPLES.exists():
+        return
+    cutoff = time.time() - CONFIG["sample_retention_days"] * 86400
+    lines = SAMPLES.read_text().splitlines()
+    if not lines:
+        return
+    header, rows = lines[0], lines[1:]
+    kept = [r for r in rows if _ts_of(r) >= cutoff]
+    if len(kept) != len(rows):
+        SAMPLES.write_text("\n".join([header, *kept]) + "\n")
+
+
+def _ts_of(row: str) -> float:
+    try:
+        return float(row.split(",", 1)[0])
+    except (ValueError, IndexError):
+        return 0.0
+
+
+def idle_samples() -> list[float]:
+    """Tccd2 readings taken while the machine was idle, newest window only."""
+    if not SAMPLES.exists():
+        return []
+    cutoff = time.time() - CONFIG["idle_window_hours"] * 3600
+    out = []
+    for row in SAMPLES.read_text().splitlines()[1:]:
+        parts = row.split(",")
+        if len(parts) < 5:
+            continue
+        try:
+            ts, load1, tccd2 = float(parts[0]), float(parts[1]), float(parts[4])
+        except ValueError:
+            continue
+        if ts >= cutoff and load1 <= CONFIG["idle_load_max"]:
+            out.append(tccd2)
+    return out
+
+
+def median(values: list[float]) -> float:
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def idle_floor() -> tuple[float | None, int]:
+    values = idle_samples()
+    if len(values) < CONFIG["idle_min_samples"]:
+        return None, len(values)
+    return median(values), len(values)
+
+
+# --- alerts ------------------------------------------------------------------
+
+
+@dataclass
+class Alert:
+    key: str
+    severity: str  # "warn" | "crit"
+    title: str
+    body: str
+    detail: dict = field(default_factory=dict)
+
+
+def checks(snap: dict) -> list[Alert]:
+    found: list[Alert] = []
+    found += check_cpu(snap)
+    found += check_drive_temps(snap)
+    found += check_gpu(snap)
+    found += check_disks(snap)
+    found += check_journal()
+    found += check_smart(snap)
+    return found
+
+
+def check_cpu(snap: dict) -> list[Alert]:
+    out = []
+    cpu = snap["sensors"].get("cpu", {})
+    tctl = cpu.get("Tctl")
+
+    if tctl is not None and tctl >= CONFIG["cpu_tctl_crit"]:
+        out.append(Alert(
+            "cpu_tctl", "crit", "CPU near throttle",
+            f"Tctl {tctl:.1f}C (limit {CONFIG['cpu_tctl_crit']:.0f}C)",
+            {"tctl": tctl, "load1": snap["load1"]},
+        ))
+
+    floor, count = idle_floor()
+    if floor is not None and floor > CONFIG["idle_floor_warn"]:
+        out.append(Alert(
+            "cpu_idle_floor", "warn", "CPU idle temperature is drifting up",
+            f"Idle Tccd2 median {floor:.1f}C over {count} idle samples "
+            f"(baseline 49-56C). Suspect the AIO pump.",
+            {"floor": floor, "samples": count},
+        ))
+    return out
+
+
+def check_drive_temps(snap: dict) -> list[Alert]:
+    out = []
+    for chip, drive in snap["sensors"].get("drives", {}).items():
+        for label, temp in drive["temps"].items():
+            limits = drive["limits"].get(label, {})
+            crit = limits.get("crit")
+            warn = limits.get("max")
+            model = drive["model"]
+            if crit is not None and temp >= crit:
+                out.append(Alert(
+                    f"drive_temp_crit:{chip}:{label}", "crit",
+                    f"{model} is critically hot",
+                    f"{label} {temp:.1f}C, drive's own critical limit {crit:.1f}C",
+                    {"model": model, "sensor": label, "temp": temp},
+                ))
+            elif warn is not None and temp >= warn:
+                out.append(Alert(
+                    f"drive_temp:{chip}:{label}", "warn",
+                    f"{model} is running hot",
+                    f"{label} {temp:.1f}C, drive's own warning limit {warn:.1f}C",
+                    {"model": model, "sensor": label, "temp": temp},
+                ))
+    return out
+
+
+def check_gpu(snap: dict) -> list[Alert]:
+    out = []
+    gpu = snap.get("gpu") or {}
+    temp, fan = gpu.get("temp"), gpu.get("fan")
+    if temp is None:
+        return out
+
+    if temp >= CONFIG["gpu_temp_crit"]:
+        out.append(Alert(
+            "gpu_temp", "crit", "GPU is critically hot",
+            f"{gpu.get('name', 'GPU')} at {temp:.0f}C", {"temp": temp},
+        ))
+    elif temp >= CONFIG["gpu_temp_warn"]:
+        out.append(Alert(
+            "gpu_temp", "warn", "GPU is running hot",
+            f"{gpu.get('name', 'GPU')} at {temp:.0f}C", {"temp": temp},
+        ))
+
+    if fan is not None and fan == 0 and temp >= CONFIG["gpu_fan_stall_temp"]:
+        out.append(Alert(
+            "gpu_fan", "crit", "GPU fan is not spinning",
+            f"Fan at 0% while the GPU is {temp:.0f}C",
+            {"temp": temp, "fan": fan},
+        ))
+    return out
+
+
+def check_disks(snap: dict) -> list[Alert]:
+    out = []
+    for path, usage in snap["disks"].items():
+        pct = usage["pct"]
+        free_gb = usage["free"] / 1024**3
+        if path == "/":
+            warn, crit = CONFIG["disk_warn_pct"], CONFIG["disk_crit_pct"]
+        else:
+            warn, crit = CONFIG["boot_warn_pct"], 95.0
+        if pct >= crit:
+            out.append(Alert(
+                f"disk:{path}", "crit", f"{path} is nearly full",
+                f"{pct:.0f}% used, {free_gb:.1f}G free",
+                {"path": path, "pct": pct},
+            ))
+        elif pct >= warn:
+            out.append(Alert(
+                f"disk:{path}", "warn", f"{path} is filling up",
+                f"{pct:.0f}% used, {free_gb:.1f}G free",
+                {"path": path, "pct": pct},
+            ))
+    return out
+
+
+def check_journal() -> list[Alert]:
+    out = []
+    hits = read_journal()
+    if "mce" in hits:
+        lines = hits["mce"]
+        out.append(Alert(
+            "journal_mce", "crit", "Hardware error in the kernel log",
+            f"{len(lines)} machine-check line(s): {lines[0][:160]}",
+            {"lines": lines[:5]},
+        ))
+    if "nvrm_oom" in hits:
+        lines = hits["nvrm_oom"]
+        out.append(Alert(
+            "journal_nvrm", "warn", "GPU is out of mappable memory",
+            f"{len(lines)} NVRM allocation failure(s). Browser and video "
+            f"processes are likely to start crashing.",
+            {"lines": lines[:5]},
+        ))
+    return out
+
+
+def check_smart(snap: dict) -> list[Alert]:
+    out = []
+    facts = snap.get("root") or {}
+    drives = facts.get("drives")
+    if not drives:
+        return out  # root timer not installed; status reports that separately
+
+    if facts.get("age_hours", 0) > CONFIG["smart_stale_hours"]:
+        out.append(Alert(
+            "smart_stale", "warn", "SMART data is stale",
+            f"Last root probe was {facts['age_hours']:.1f}h ago. "
+            f"Check vitals-root.timer.",
+            {"age_hours": facts["age_hours"]},
+        ))
+        return out
+
+    previous = load_alert_state().get("_smart_counters", {})
+    counters = {}
+
+    for dev, drive in drives.items():
+        model = drive.get("model", dev)
+        counters[dev] = {
+            "unsafe_shutdowns": drive.get("unsafe_shutdowns"),
+            "media_errors": drive.get("media_errors"),
+        }
+
+        if drive.get("health") not in (None, "PASSED"):
+            out.append(Alert(
+                f"smart_health:{dev}", "crit", f"{model} failed its SMART check",
+                f"Health: {drive.get('health')}. Back this drive up now.",
+                {"device": dev},
+            ))
+        if drive.get("critical_warning"):
+            out.append(Alert(
+                f"smart_warning:{dev}", "crit", f"{model} raised a critical warning",
+                f"NVMe critical_warning = {drive['critical_warning']}",
+                {"device": dev},
+            ))
+
+        spare = drive.get("available_spare")
+        spare_min = drive.get("available_spare_threshold")
+        if spare is not None and spare_min is not None and spare <= spare_min:
+            out.append(Alert(
+                f"smart_spare:{dev}", "crit", f"{model} is out of spare blocks",
+                f"Available spare {spare}% at or below the drive's {spare_min}% floor",
+                {"device": dev},
+            ))
+
+        used = drive.get("percentage_used")
+        if used is not None and used >= CONFIG["smart_percentage_used_warn"]:
+            out.append(Alert(
+                f"smart_wear:{dev}", "warn", f"{model} is near its endurance rating",
+                f"Percentage used {used}%", {"device": dev},
+            ))
+
+        errors = drive.get("media_errors")
+        was = (previous.get(dev) or {}).get("media_errors")
+        if errors and (was is None or errors > was):
+            out.append(Alert(
+                f"smart_media:{dev}", "crit", f"{model} reported data integrity errors",
+                f"Media and data integrity errors: {errors}", {"device": dev},
+            ))
+
+        # Rising unsafe shutdowns is the evidence for the UPS case (COS-181).
+        shutdowns = drive.get("unsafe_shutdowns")
+        prior = (previous.get(dev) or {}).get("unsafe_shutdowns")
+        if shutdowns is not None and prior is not None and shutdowns > prior:
+            out.append(Alert(
+                f"smart_unsafe:{dev}", "warn", "Unsafe shutdown recorded",
+                f"{model} count went {prior} -> {shutdowns}. The machine lost "
+                f"power without flushing its write cache.",
+                {"device": dev, "count": shutdowns},
+            ))
+
+    save_smart_counters(counters)
+    return out
+
+
+# --- alert state and delivery ------------------------------------------------
+
+
+def load_alert_state() -> dict:
+    try:
+        return json.loads(ALERT_STATE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_alert_state(state: dict) -> None:
+    ALERT_STATE.parent.mkdir(parents=True, exist_ok=True)
+    ALERT_STATE.write_text(json.dumps(state, indent=2))
+
+
+def save_smart_counters(counters: dict) -> None:
+    state = load_alert_state()
+    state["_smart_counters"] = counters
+    save_alert_state(state)
+
+
+def notify(title: str, body: str, severity: str, key: str) -> None:
+    urgency = "critical" if severity == "crit" else "normal"
+    icon = "dialog-error" if severity == "crit" else "dialog-warning"
+    env = dict(os.environ)
+    env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{os.getuid()}/bus")
+    subprocess.run(
+        [
+            "notify-send", "-a", "vitals", "-u", urgency, "-i", icon,
+            # Replace the previous toast for this check instead of stacking.
+            "-h", f"string:x-canonical-private-synchronous:vitals-{key}",
+            title, body,
+        ],
+        env=env, check=False, capture_output=True,
+    )
+
+
+def deliver(alert: Alert, kind: str = "fire") -> None:
+    """The one place alerts leave the process. Remote delivery hooks in here."""
+    if kind == "fire":
+        notify(alert.title, alert.body, alert.severity, alert.key)
+    else:
+        notify(f"Recovered: {alert.title}", alert.body, "warn", alert.key)
+
+    ALERT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with ALERT_LOG.open("a") as fh:
+        fh.write(json.dumps({
+            "ts": time.time(), "kind": kind, "key": alert.key,
+            "severity": alert.severity, "title": alert.title,
+            "body": alert.body, "detail": alert.detail,
+        }) + "\n")
+
+
+def cooldown_seconds(severity: str) -> float:
+    hours = CONFIG["cooldown_crit_hours"] if severity == "crit" else CONFIG["cooldown_warn_hours"]
+    return hours * 3600
+
+
+def dispatch(alerts: list[Alert], quiet: bool = False) -> None:
+    """Fire new or escalated alerts, announce recoveries, respect cooldowns."""
+    state = load_alert_state()
+    now = time.time()
+    firing = {a.key: a for a in alerts}
+
+    for key, alert in firing.items():
+        previous = state.get(key)
+        escalated = previous and previous.get("severity") != alert.severity
+        due = not previous or escalated or (
+            now - previous.get("last_sent", 0) >= cooldown_seconds(alert.severity)
+        )
+        if due and not quiet:
+            deliver(alert)
+        state[key] = {
+            "severity": alert.severity,
+            "title": alert.title,
+            "body": alert.body,
+            "since": (previous or {}).get("since", now),
+            "last_sent": now if due else (previous or {}).get("last_sent", 0),
+        }
+
+    for key in [k for k in state if not k.startswith("_") and k not in firing]:
+        gone = state.pop(key)
+        if not quiet:
+            deliver(
+                Alert(key, gone.get("severity", "warn"), gone.get("title", key),
+                      "Back to normal."),
+                kind="clear",
+            )
+
+    save_alert_state(state)
+
+
+# --- commands ----------------------------------------------------------------
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    snap = probe()
+    record_sample(snap)
+    alerts = checks(snap)
+    dispatch(alerts, quiet=args.quiet)
+    for alert in alerts:
+        print(f"[{alert.severity}] {alert.title}: {alert.body}")
+    return 1 if any(a.severity == "crit" for a in alerts) else 0
+
+
+def cmd_probe(args: argparse.Namespace) -> int:
+    print(json.dumps(probe(), indent=2, default=str))
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    snap = probe()
+    cpu = snap["sensors"].get("cpu", {})
+    gpu = snap.get("gpu") or {}
+
+    print(f"load   {snap['load1']:.2f}")
+    readings = "  ".join(
+        f"{label} {value:.1f}C" for label, value in sorted(cpu.items())
+    )
+    print(f"cpu    {readings}" if readings else "cpu    unavailable")
+
+    floor, count = idle_floor()
+    if floor is None:
+        print(f"       idle floor: not enough idle samples yet ({count}/"
+              f"{CONFIG['idle_min_samples']})")
+    else:
+        verdict = "OK" if floor <= CONFIG["idle_floor_warn"] else "HIGH"
+        print(f"       idle floor: Tccd2 median {floor:.1f}C over {count} "
+              f"samples, limit {CONFIG['idle_floor_warn']:.0f}C [{verdict}]")
+
+    if gpu:
+        print(f"gpu    {gpu['name']}  {gpu['temp']:.0f}C  fan {gpu['fan']:.0f}%  "
+              f"{gpu['power']:.0f}W  {gpu['mem_used']:.0f}/{gpu['mem_total']:.0f} MiB")
+
+    for chip, drive in snap["sensors"].get("drives", {}).items():
+        temps = "  ".join(f"{k} {v:.1f}C" for k, v in drive["temps"].items())
+        limit = drive["limits"].get("Composite", {}).get("max")
+        suffix = f"  (warn {limit:.0f}C)" if limit else ""
+        print(f"drive  {drive['model']}: {temps}{suffix}")
+
+    for path, usage in snap["disks"].items():
+        print(f"disk   {path}  {usage['pct']:.0f}% used, "
+              f"{usage['free'] / 1024**3:.1f}G free")
+
+    root = snap.get("root") or {}
+    if not root.get("drives"):
+        print("smart  unavailable - the root timer is not installed "
+              "(see install.sh)")
+    else:
+        age = root.get("age_hours", 0)
+        for dev, drive in root["drives"].items():
+            print(f"smart  {drive.get('model', dev)}: {drive.get('health')}, "
+                  f"{drive.get('percentage_used')}% used, "
+                  f"spare {drive.get('available_spare')}%, "
+                  f"{drive.get('media_errors')} media errors, "
+                  f"{drive.get('unsafe_shutdowns')} unsafe shutdowns")
+        print(f"       (read {age:.1f}h ago)")
+
+    state = {k: v for k, v in load_alert_state().items() if not k.startswith("_")}
+    if state:
+        print("\nfiring:")
+        for key, entry in state.items():
+            age = (time.time() - entry.get("since", 0)) / 3600
+            print(f"  [{entry['severity']}] {entry['title']} - {entry['body']} "
+                  f"({age:.1f}h)")
+    else:
+        print("\nnothing firing")
+    return 0
+
+
+def cmd_log(args: argparse.Namespace) -> int:
+    if not ALERT_LOG.exists():
+        print("no alerts recorded")
+        return 0
+    lines = ALERT_LOG.read_text().splitlines()[-args.n:]
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(entry["ts"]))
+        mark = "FIRE" if entry["kind"] == "fire" else "CLEAR"
+        print(f"{when}  {mark:5} [{entry['severity']}] {entry['title']}: "
+              f"{entry['body']}")
+    return 0
+
+
+def cmd_root_probe(args: argparse.Namespace) -> int:
+    """Root-only facts, written where the user timer can read them."""
+    if os.geteuid() != 0:
+        print("vitals root-probe must run as root", file=sys.stderr)
+        return 2
+
+    drives = {}
+    for dev in sorted(Path("/dev").glob("nvme[0-9]n1")):
+        raw = run(["smartctl", "-j", "-a", str(dev)], timeout=30)
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        log = data.get("nvme_smart_health_information_log", {})
+        drives[str(dev)] = {
+            "model": data.get("model_name"),
+            "serial_present": bool(data.get("serial_number")),
+            "health": "PASSED" if data.get("smart_status", {}).get("passed") else "FAILED",
+            "critical_warning": log.get("critical_warning"),
+            "temperature": log.get("temperature"),
+            "available_spare": log.get("available_spare"),
+            "available_spare_threshold": log.get("available_spare_threshold"),
+            "percentage_used": log.get("percentage_used"),
+            "media_errors": log.get("media_errors"),
+            "unsafe_shutdowns": log.get("unsafe_shutdowns"),
+            "power_cycles": log.get("power_cycles"),
+            "power_on_hours": log.get("power_on_hours"),
+        }
+
+    facts = {"ts": time.time(), "drives": drives}
+
+    snapshots = run(["snapper", "--machine-readable", "json", "list"], timeout=30)
+    if snapshots:
+        try:
+            parsed = json.loads(snapshots)
+            facts["snapshots"] = {
+                config: len(entries) for config, entries in parsed.items()
+            }
+        except json.JSONDecodeError:
+            pass
+
+    ROOT_FACTS.parent.mkdir(parents=True, exist_ok=True)
+    tmp = ROOT_FACTS.with_suffix(".tmp")
+    tmp.write_text(json.dumps(facts, indent=2))
+    tmp.chmod(0o644)
+    tmp.replace(ROOT_FACTS)
+    print(f"wrote {ROOT_FACTS} ({len(drives)} drive(s))")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="vitals", description="watch the things that can take this desktop down"
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    check = sub.add_parser("check", help="run every probe and alert on what is wrong")
+    check.add_argument("--quiet", action="store_true",
+                       help="evaluate and record, but send no notifications")
+    check.set_defaults(func=cmd_check)
+
+    sub.add_parser("status", help="print what everything reads right now"
+                   ).set_defaults(func=cmd_status)
+    sub.add_parser("probe", help="dump the raw readings as JSON"
+                   ).set_defaults(func=cmd_probe)
+
+    log = sub.add_parser("log", help="recent alerts")
+    log.add_argument("-n", type=int, default=20, help="how many lines")
+    log.set_defaults(func=cmd_log)
+
+    sub.add_parser("root-probe", help="write SMART facts (run as root)"
+                   ).set_defaults(func=cmd_root_probe)
+
+    args = parser.parse_args()
+    load_config()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,9 @@
+[Unit]
+Description=Check machine vitals
+Documentation=https://linear.app/costafotiadis/issue/COS-183
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/vitals check
+# A probe that wedges must not pile up behind the next tick.
+TimeoutStartSec=60
