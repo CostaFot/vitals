@@ -26,12 +26,23 @@ Everything lives in `~/.local/state/vitals/`:
 | File | Holds |
 |---|---|
 | `samples.csv` | one row per minute: ts, load1, Tctl, Tccd1, Tccd2, gpu temp, gpu fan. Trimmed to 30 days |
+| `readings.csv` | long format (ts, metric, subject, value) for drive temperatures and disk usage, which have no fixed column count. Trimmed to 30 days |
+| `smart.jsonl` | one line per hourly root probe, because `root.json` is overwritten and wear only means something as a trend |
 | `alerts.json` | currently firing alerts, plus `_smart_counters` for detecting a rising unsafe-shutdown count |
 | `alerts.jsonl` | append-only log of every fire and clear |
 | `journal.cursor` | journalctl cursor, so each run only sees new kernel lines |
 
 Keys in `alerts.json` that start with `_` are internal bookkeeping, not alerts;
 the dispatch loop skips them when deciding what has recovered.
+
+Two flags on `Alert` decide what happens to it, and both are carried through
+`alerts.json` so the clear path can still see them:
+
+- `event` - it happened rather than being true now (machine checks, NVRM
+  failures, unsafe shutdowns, media errors). Fires once, no recovery notice.
+- `emergency` - it is allowed to reach the desktop. Four alerts set it: SMART
+  health, NVMe critical warning, spare exhausted, drive at its critical
+  temperature. Everything else is logged silently and read back by `report`.
 
 ## Things that are easy to get wrong
 
@@ -44,8 +55,10 @@ falls back to printing chip names instead of models.
 65261.85 (the "no limit" sentinel). Anything above 1000 is discarded.
 
 **The 990 EVO Plus runs hot on `Sensor 1`, not `Composite`.** Composite sits
-around 47C while Sensor 1 is at 65C. Every sensor on a drive is checked, not
-just Composite.
+around 47C while Sensor 1 is at 65C. `check_drive_temps` walks every sensor,
+but only `Composite` reports usable limits on either drive, so Sensor 1 has
+nothing to be judged against and never alerts. It is in `readings.csv` and in
+`vitals report`, which is where it actually gets looked at.
 
 **Journal cursor seeding.** `journalctl` only writes `--cursor-file` for entries
 it actually printed, so `--since=now` leaves the cursor unset and the next run

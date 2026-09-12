@@ -1,6 +1,6 @@
 # vitals
 
-Watches the handful of things that can take this desktop down and puts a notification on screen when one of them starts going wrong. Arch, systemd user timer, once a minute.
+Records the handful of things that can take this desktop down, once a minute, so the numbers can be read back the next morning. Arch, systemd user timer.
 
 There is no web UI, no metrics database and no bar widget.
 
@@ -16,6 +16,19 @@ There is no web UI, no metrics database and no bar widget.
 | Disk space | `/` above 85%, `/boot` above 80% |
 | GPU | 88C or 92C held for five minutes, or a fan reading 0% while the card is above 50C |
 | Kernel log | machine checks, or NVRM allocation failures |
+
+## What reaches the screen
+
+Almost nothing. The readings are the product and the thresholds below are evaluated quietly, so the day's evidence is on disk by morning rather than interrupting the afternoon.
+
+Four conditions still put a notification up, because they mean the drive is going now rather than by Tuesday:
+
+- SMART health reports FAILED
+- the drive raises an NVMe critical warning
+- spare blocks reach the drive's own floor
+- a drive passes its own critical temperature
+
+Everything else is written to the log and waits.
 
 The idle floor is the one worth explaining. The AIO sits on a board header and the IT8688E chip on this motherboard has no driver bound, so `sensors` reports no pump RPM at all — if the pump weakens, nothing says so. What does change is the temperature the CPU settles at when nothing is happening. So only the samples taken while the load average was low are kept, and the median of those is what gets watched.
 
@@ -51,6 +64,7 @@ Until that one is installed, `vitals status` says SMART is unavailable and every
 
 ```sh
 vitals status    # what everything reads right now
+vitals report    # summarise a window, for the morning read
 vitals log       # alerts that fired, and when they cleared
 vitals check     # run every probe now
 vitals probe     # raw readings as JSON
@@ -72,6 +86,8 @@ smart  Samsung SSD 990 EVO Plus 2TB: PASSED, 0% used, spare 100%, 0 media errors
 nothing firing
 ```
 
+`vitals report` defaults to the last 24 hours and takes `--hours`. It prints min, median, p95 and max for every metric, the idle floor, each drive sensor against its limit, disk drift, the SMART counters with their deltas, and any gaps in sampling, which are how you tell the machine was asleep rather than cold. `--json` for something that has to parse it.
+
 ## Configuration
 
 Optional. Anything in `~/.config/vitals/config.toml` overrides the defaults:
@@ -89,7 +105,9 @@ A broken config file is ignored with a complaint rather than taking the monitor 
 
 ## Notes and limitations
 
-Alerts go to the desktop and nowhere else, because this machine is attended. Everything leaves through one `deliver()` function, so ntfy or email is a small change if that stops being true.
+The four emergencies go to the desktop and nowhere else. Everything leaves through one `deliver()` function, so ntfy or email is a small change if that stops being true.
+
+Sensor 1 and Sensor 2 on both drives report no usable limits, only the sentinel value that means none was set, so `Composite` is the only sensor ever judged against a threshold. The 990 EVO Plus runs hottest on Sensor 1. Every sensor is in the report regardless, which is now where the judgement happens.
 
 The idle floor stays quiet until it has 30 idle samples, so a fresh install says nothing useful for the first half hour.
 
