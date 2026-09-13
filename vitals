@@ -55,7 +55,13 @@ CONFIG: dict = {
     # RTX 3080: max operating 93C, slowdown 95C, shutdown 98C.
     "gpu_temp_warn": 88.0,
     "gpu_temp_crit": 92.0,
-    "gpu_fan_stall_temp": 50.0,    # 0% fan while this warm = fan failure
+    # Core temperature does not predict fan state on this card: the samples
+    # caught it restarting the fan at 42C after four hours off, then sitting
+    # at 51-52C for nine hours with the fan legitimately stopped. The fan
+    # curve reads the GDDR6X junction, which nvidia-smi will not report on a
+    # consumer card, so this gate only has the core to go on and has to clear
+    # the whole passive plateau. 60C does; 50C fired ten times on 2026-09-13.
+    "gpu_fan_stall_temp": 60.0,    # 0% fan while this warm = fan failure
     "gpu_fan_confirm_minutes": 2,  # ...and still 0% this long later
     "sustained_minutes": 5,        # a gaming session is not an emergency
 
@@ -305,6 +311,27 @@ def probe() -> dict:
 # --- samples and the idle floor ----------------------------------------------
 
 
+SAMPLE_HEADER = "ts,load1,tctl,tccd1,tccd2,gpu_temp,gpu_fan,gpu_power"
+
+
+def migrate_header(path: Path, header: str) -> None:
+    """Bring an older file's header up to date without touching its rows.
+
+    Columns are only ever appended, so a row written before the new column
+    existed is still correct - it is just short, and every reader here
+    tolerates that. The header is the one line that would otherwise keep
+    describing a file that has outgrown it.
+    """
+    if not path.exists():
+        return
+    with path.open() as fh:
+        first = fh.readline().rstrip("\n")
+    if first == header or not first.startswith("ts,"):
+        return
+    lines = path.read_text().splitlines()
+    path.write_text("\n".join([header, *lines[1:]]) + "\n")
+
+
 def record_sample(snap: dict) -> None:
     cpu = snap["sensors"].get("cpu", {})
     gpu = snap.get("gpu", {})
@@ -316,12 +343,18 @@ def record_sample(snap: dict) -> None:
         f"{cpu.get('Tccd2', '')}",
         f"{gpu.get('temp', '')}",
         f"{gpu.get('fan', '')}",
+        # Recorded but not yet judged. A stopped fan only matters on a card
+        # that is doing work, and power draw is the one signal here that says
+        # so - 20-35W idle against 250-350W under load. The gate above cannot
+        # use it until there is enough history to pick the number honestly.
+        f"{gpu.get('power', '')}",
     ]
     SAMPLES.parent.mkdir(parents=True, exist_ok=True)
     new = not SAMPLES.exists()
+    migrate_header(SAMPLES, SAMPLE_HEADER)
     with SAMPLES.open("a") as fh:
         if new:
-            fh.write("ts,load1,tctl,tccd1,tccd2,gpu_temp,gpu_fan\n")
+            fh.write(SAMPLE_HEADER + "\n")
         fh.write(",".join(row) + "\n")
     trim_csv(SAMPLES)
 
@@ -1011,8 +1044,8 @@ def summarise(values: list[float]) -> dict | None:
     }
 
 
-SAMPLE_COLUMNS = (("load1", 1), ("tctl", 2), ("tccd1", 3),
-                  ("tccd2", 4), ("gpu_temp", 5), ("gpu_fan", 6))
+SAMPLE_COLUMNS = (("load1", 1), ("tctl", 2), ("tccd1", 3), ("tccd2", 4),
+                  ("gpu_temp", 5), ("gpu_fan", 6), ("gpu_power", 7))
 
 
 def report_data(hours: float) -> dict:
@@ -1025,14 +1058,20 @@ def report_data(hours: float) -> dict:
         for row in SAMPLES.read_text().splitlines()[1:]:
             parts = row.split(",")
             ts = _ts_of(row)
-            if ts < since or len(parts) <= SAMPLE_COLUMNS[-1][1]:
+            if ts < since:
                 continue
+            # Short rows are rows written before a column was added, not bad
+            # rows. Requiring the widest column here would drop every sample
+            # taken before the newest one existed and quietly shorten the
+            # window the morning read believes it is looking at.
             values = {}
             for name, idx in SAMPLE_COLUMNS:
                 try:
                     values[name] = float(parts[idx])
-                except ValueError:
+                except (ValueError, IndexError):
                     pass
+            if not values:
+                continue
             parsed.append((ts, values))
     parsed.sort(key=lambda pair: pair[0])
 

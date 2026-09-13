@@ -33,7 +33,7 @@ Everything lives in `~/.local/state/vitals/`:
 
 | File | Holds |
 |---|---|
-| `samples.csv` | one row per minute: ts, load1, Tctl, Tccd1, Tccd2, gpu temp, gpu fan. Trimmed to 30 days |
+| `samples.csv` | one row per minute: ts, load1, Tctl, Tccd1, Tccd2, gpu temp, gpu fan, gpu power. Trimmed to 30 days |
 | `readings.csv` | long format (ts, metric, subject, value) for drive temperatures and disk usage, which have no fixed column count. Trimmed to 30 days |
 | `smart.jsonl` | one line per hourly root probe, because `root.json` is overwritten and wear only means something as a trend |
 | `alerts.json` | currently firing alerts, plus `_smart_counters` for detecting a rising unsafe-shutdown count |
@@ -50,18 +50,28 @@ Two flags on `Alert` decide what happens to it, and both are carried through
 - `event` - it happened rather than being true now (machine checks, NVRM
   failures, unsafe shutdowns, media errors). Fires once, no recovery notice.
 - `emergency` - it is allowed to reach the desktop. **One check sets it**: a GPU
-  fan reading 0% while the card is above 50C, confirmed across two samples a
+  fan reading 0% while the card is above 60C, confirmed across two samples a
   minute apart. It is the only failure here that gets worse unattended and that
   nothing else watches — chips throttle, disks wait, drives are smartd's. The
   four alerts that used to set it were SMART health, NVMe critical warning,
   spare exhausted and drive-at-critical-temperature, all bits in the same NVMe
   critical-warning byte that `smartd -H` reads directly (COS-188, COS-189).
 
-  The two-sample confirm is the whole reason it can be trusted. A 3080 stops its
-  fan below roughly 45C on purpose — the samples caught this card doing it at
-  42-45C and spinning back up at 45C — so 0% on its own is normal, and the 50C
-  gate sits above the card's own restart point. `fan_stopped()` is deliberately
-  separate from `sustained()`, which tests for values *above* a threshold.
+  The two-sample confirm handles the driver hiccup: a lone 0% reading at any
+  temperature says nothing. `fan_stopped()` is deliberately separate from
+  `sustained()`, which tests for values *above* a threshold.
+
+  The gate was 50C until 2026-09-13, when it fired ten times overnight on a
+  perfectly healthy card (COS-196). **Core temperature does not order this
+  card's fan states.** The first night of samples has it restarting the fan at
+  42C after 253 minutes off, and then stopped for 537 minutes at 51-52C. No
+  fixed core-temp threshold separates those two, because the fan curve is
+  reading the GDDR6X junction and `nvidia-smi` will not report that on a
+  consumer card. 60C was picked to clear the whole observed passive plateau
+  with margin; a working fan cannot hold this card at 60C, and a dead one
+  under load passes 60C within a minute. It is still a number derived from one
+  night — `gpu_power` is now in `samples.csv` so the check can eventually ask
+  whether the card is doing work instead of guessing from temperature.
 
 ## The morning read
 
@@ -115,6 +125,13 @@ re-reads the whole boot. First run uses `-n 1` to seed at the newest line.
 **The benign MCE banner.** `MCE: In-kernel MCE decoding enabled.` appears at
 every boot and matches the `machine check` pattern. It is in `JOURNAL_IGNORE`.
 
+**Columns are appended to `samples.csv`, never inserted.** A row written
+before a column existed is short, not corrupt, and every reader must tolerate
+that — `report_data` once required the widest column and would have dropped the
+entire history the moment `gpu_power` was added. `migrate_header()` rewrites the
+header line when it falls behind, because `trim_csv()` preserves whatever header
+it finds and would otherwise keep the old one forever.
+
 **Idle-floor sampling is load-filtered on purpose.** A plain rolling average of
 Tccd2 would rise with workload and alert on a busy afternoon. Only samples with
 `load1 <= idle_load_max` count, and the statistic is a median so a single spike
@@ -145,15 +162,16 @@ loader = importlib.machinery.SourceFileLoader("v", "vitals")
 v = importlib.util.module_from_spec(importlib.util.spec_from_loader("v", loader))
 sys.modules["v"] = v; loader.exec_module(v)
 now, f = time.time(), pathlib.Path(tempfile.mkstemp(suffix=".csv")[1])
-f.write_text("ts,load1,tctl,tccd1,tccd2,gpu_temp,gpu_fan\n" + "".join(
-    f"{now-age},0.5,60,60,50,72,0\n" for age in (0, 60, 120)))
+f.write_text(v.SAMPLE_HEADER + "\n" + "".join(
+    f"{now-age},0.5,60,60,50,72,0,300\n" for age in (0, 60, 120)))
 v.SAMPLES = f
 print(v.check_gpu({"gpu": {"name": "RTX 3080", "temp": 72.0, "fan": 0.0}}))
 EOF
 ```
 
 Change one of those `0` fan values to `47` and it must go silent — that is the
-driver-hiccup case the confirm exists for.
+driver-hiccup case the confirm exists for. Drop the `72` to `52` and it must
+also go silent, which is the idle plateau that used to wake the house.
 
 smartd has its own end-to-end test, which runs the real `-M exec` path and puts a
 real toast on screen, one per drive:
