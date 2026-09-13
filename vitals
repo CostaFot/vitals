@@ -406,6 +406,32 @@ def record_readings(snap: dict) -> None:
     trim_csv(READINGS)
 
 
+def last_line(path: Path) -> str:
+    """The final line of a file without reading the rest of it.
+
+    smart.jsonl is the one state file with no retention, on purpose - drive
+    wear only means something over years, so it outlives the 30 days of
+    samples by design. That makes it the one file a once-a-minute job must
+    never read whole: reading it all to look at the last line was 7ms a
+    minute after a year and 31ms after five.
+    """
+    with path.open("rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        end = fh.tell()
+        if end == 0:
+            return ""
+        size = 0
+        while True:
+            size = min(max(size * 2, 4096), end)
+            fh.seek(end - size)
+            lines = fh.read(size).splitlines()
+            # A chunk that does not start on a line boundary may have cut its
+            # first line in half, so one line is not proof the last is whole.
+            if len(lines) > 1 or size == end:
+                break
+    return lines[-1].decode("utf-8", "replace") if lines else ""
+
+
 def record_smart(snap: dict) -> None:
     """The root timer overwrites root.json hourly, so wear, media errors and
     shutdown counts would have no history at all. Keep one line per probe."""
@@ -414,10 +440,10 @@ def record_smart(snap: dict) -> None:
     if not facts.get("drives") or not facts.get("ts"):
         return
     if SMART_LOG.exists():
-        lines = SMART_LOG.read_text().splitlines()
-        if lines:
+        newest = last_line(SMART_LOG)
+        if newest:
             try:
-                if json.loads(lines[-1]).get("ts") == facts["ts"]:
+                if json.loads(newest).get("ts") == facts["ts"]:
                     return  # same hourly probe, already recorded
             except json.JSONDecodeError:
                 pass

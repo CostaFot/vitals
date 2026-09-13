@@ -35,7 +35,7 @@ Everything lives in `~/.local/state/vitals/`:
 |---|---|
 | `samples.csv` | one row per minute: ts, load1, Tctl, Tccd1, Tccd2, gpu temp, gpu fan, gpu power. Trimmed to 30 days |
 | `readings.csv` | long format (ts, metric, subject, value) for drive temperatures and disk usage, which have no fixed column count. Trimmed to 30 days |
-| `smart.jsonl` | one line per hourly root probe, because `root.json` is overwritten and wear only means something as a trend |
+| `smart.jsonl` | one line per hourly root probe, because `root.json` is overwritten and wear only means something as a trend. **No retention** - the trend is the point, so read it with `last_line()`, never whole |
 | `alerts.json` | currently firing alerts, plus `_smart_counters` for detecting a rising unsafe-shutdown count |
 | `alerts.jsonl` | append-only log of every fire and clear |
 | `journal.cursor` | journalctl cursor, so each run only sees new kernel lines |
@@ -191,6 +191,14 @@ alert; starting it again clears it.
 Fan and pump RPM via `it87-dkms`: needs `acpi_enforce_resources=lax` as a kernel
 parameter on this Gigabyte board. Dropped 2026-09-12, decision recorded on
 COS-183. Do not re-propose it.
+
+Tail reads for `samples.csv`. `idle_samples()`, `sustained()` and
+`fan_stopped()` each scan the whole file, which is 2ms today and about 80ms once
+retention fills, every minute. Measured and left alone on 2026-09-13: the file
+is capped at 30 days, so that is a ceiling rather than a trend, and 80ms a
+minute is 0.13% of one core. The saving is real but small, and it is paid for
+in the three functions that decide whether something reaches the screen at
+3am. `smart.jsonl` got the tail read instead because it has no cap at all.
 
 Remote alert delivery: decided against for now, the machine is attended. If it
 comes back, `deliver()` is the only function that needs to change.
