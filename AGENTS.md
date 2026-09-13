@@ -23,8 +23,10 @@ one daemon that is not ours do the watching; a scheduled agent does the reading
   critical-warning byte every 30 minutes and logs `LOG_CRIT` if any bit is set.
   `-M exec` runs `smartd-notify`, the other thing here that puts anything on screen.
 
-`install.sh` symlinks rather than copies, so editing the repo changes what runs.
-It rewrites the `DEVICESCAN` line in `/etc/smartd.conf` and keeps the original at
+`install.sh` symlinks the user half and `vitals` itself, so editing the repo
+changes what runs. The two root units are the exception: they are copied, and
+editing them means re-running the installer (see Things that are easy to get
+wrong). It rewrites the `DEVICESCAN` line in `/etc/smartd.conf` and keeps the original at
 `/etc/smartd.conf.before-vitals`, which `uninstall.sh` puts back.
 
 ## State
@@ -136,6 +138,23 @@ it finds and would otherwise keep the old one forever.
 Tccd2 would rise with workload and alert on a busy afternoon. Only samples with
 `load1 <= idle_load_max` count, and the statistic is a median so a single spike
 cannot move it.
+
+**The root units are copies, not symlinks.** systemd builds the boot transaction
+before `/home` is mounted, so a root unit symlinked into the repo is a dangling
+link at the moment `timers.target` reads it, and the miss is cached for the rest
+of the boot without a word in the journal. The hourly SMART read simply stops at
+the first reboot while `vitals report` keeps printing the last numbers it saw, so
+a frozen `root.json` reads exactly like a quiet drive. `install.sh` copies
+`vitals-root.{service,timer}` into `/etc/systemd/system`, which means editing
+them in the repo does nothing until it is re-run. The user units stay symlinks:
+that manager starts at login, long after `/home` is up.
+
+**A timer enabled hours after boot does not fire.** `vitals-root.timer` is
+monotonic, so on a machine that booted more than a minute ago the `OnBootSec`
+point is already past and the unit goes straight to `elapsed` with nothing
+scheduled until the next boot. `install.sh` starts `vitals-root.service` once
+for that reason: the run is what `OnUnitActiveSec` counts its hour from.
+`Persistent=true` does not rescue it, applying only to `OnCalendar` timers.
 
 ## Testing without waiting for a real fault
 

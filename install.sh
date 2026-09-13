@@ -38,11 +38,24 @@ echo "user timer installed: vitals.timer (every minute)"
 
 if (( WITH_SMART )); then
   "${SUDO[@]}" ln -sf "$REPO/vitals" /usr/local/bin/vitals
+  # Copied, not symlinked. systemd builds the boot transaction before /home is
+  # mounted, so a root unit symlinked into the repo is a dangling link at the
+  # moment timers.target reads it, and the miss is cached for the rest of the
+  # boot without a word in the journal. The user units can stay symlinks: that
+  # manager starts at login, long after /home is up.
   for unit in vitals-root.service vitals-root.timer; do
-    "${SUDO[@]}" ln -sf "$REPO/systemd/$unit" /etc/systemd/system/"$unit"
+    "${SUDO[@]}" install -m 644 "$REPO/systemd/$unit" /etc/systemd/system/"$unit"
   done
   "${SUDO[@]}" systemctl daemon-reload
-  "${SUDO[@]}" systemctl enable --now vitals-root.timer
+  # reenable rather than enable, so an install that still has the old symlink
+  # in timers.target.wants gets it rewritten to point at the copy.
+  "${SUDO[@]}" systemctl reenable vitals-root.timer
+  "${SUDO[@]}" systemctl start vitals-root.timer
+  # One read now, which also anchors OnUnitActiveSec. A timer enabled on a
+  # machine that booted more than a minute ago is already past its OnBootSec
+  # point, and sits elapsed with nothing scheduled until the next boot unless
+  # the service has run once to count an hour from.
+  "${SUDO[@]}" systemctl start vitals-root.service
   echo "root timer installed: vitals-root.timer (hourly SMART read)"
 
   # smartd is the emergency tier. vitals does not duplicate it.
