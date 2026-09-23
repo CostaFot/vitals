@@ -10,13 +10,13 @@ A drive dying is the one thing that cannot wait for the morning, and that job be
 
 | Check | Fires when |
 |---|---|
-| CPU idle floor | the median `Tccd2` across idle samples from the last 24h goes above 65C |
+| CPU idle floor | the median `Tccd2` across idle samples from the last 24h goes above 58C |
 | CPU hard limit | `Tctl` holds 89C for five minutes |
 | NVMe temperature | a drive passes its own warning or critical limit |
 | SMART | media errors appear, or wear passes 90% |
 | Unsafe shutdowns | the drive's counter goes up |
 | Disk space | `/` above 85%, `/boot` above 80% |
-| GPU | 88C or 92C held for five minutes, or a fan reading 0% while the card is above 60C |
+| GPU | 88C or 92C held for five minutes, or a fan reading 0% while the card draws 60W or more |
 | Kernel log | machine checks, or NVRM allocation failures |
 | smartd | it is enabled but not running, so nothing is watching the drives |
 
@@ -24,9 +24,9 @@ A drive dying is the one thing that cannot wait for the morning, and that job be
 
 Two things, and a stopped GPU fan is one of them. Everything else here is evaluated quietly, so the day's evidence is on disk by noon rather than interrupting the afternoon.
 
-The fan is the exception because it is the only failure on this machine that gets worse while nobody is looking. A hot chip throttles itself, a full disk waits, a dying drive is `smartd`'s. A 3080 with a dead fan under load climbs to its 95C slowdown and sits there, and the card cannot tell anyone. The alert needs 0% twice a minute apart while the card is above 60C, so a single cool reading means nothing and a driver hiccup means nothing either.
+The fan is the exception because it is the only failure on this machine that gets worse while nobody is looking. A hot chip throttles itself, a full disk waits, a dying drive is `smartd`'s. A 3080 with a dead fan under load climbs to its 95C slowdown and sits there, and the card cannot tell anyone. The alert needs 0% twice a minute apart while the card is drawing 60W or more both times, so a single reading means nothing and a driver hiccup means nothing either.
 
-60C is high because the card's own fan curve does not follow the number `nvidia-smi` reports. The first night of samples caught it restarting the fan at 42C after four hours off, then sitting at 51-52C for nine hours with the fan stopped and nothing wrong. The curve is reading the GDDR6X junction, which a consumer card will not report, so the core temperature is all this has and the gate has to clear the whole passive plateau. The first attempt put it at 50C and got ten notifications before breakfast.
+Power is the test, not temperature, because the card's own fan curve does not follow the number `nvidia-smi` reports. The first night of samples caught it restarting the fan at 42C after four hours off, then sitting at 51-52C for nine hours with the fan stopped and nothing wrong. The curve is reading the GDDR6X junction, which a consumer card will not report. A temperature gate had to clear that whole passive plateau: the first attempt at 50C got ten notifications before breakfast, and 60C held for ten days without saying whether the card was working. Eleven days of power samples settled it. With the fan stopped the card never drew more than 30W across two consecutive minutes; with anything to do it drew 100W to 285W with the fan on. So a stopped fan at 60W is a fan that should be spinning, whatever the core reads. A 70C gate stays as the backstop for a hot card with no power reading.
 
 The other is `smartd`. Every half hour it reads the NVMe critical-warning byte and logs at `LOG_CRIT` if the drive has set a bit in it. Those bits are failed health, spare blocks at the drive's own floor, and a temperature past the drive's own critical limit — the cases where the drive is going now rather than by Tuesday. The drive is the one saying so, which is better than a script deriving the same verdict from the same byte.
 
@@ -106,8 +106,9 @@ nothing firing
 Optional. Anything in `~/.config/vitals/config.toml` overrides the defaults:
 
 ```toml
-idle_floor_warn = 65.0      # median idle Tccd2 that counts as a problem
+idle_floor_warn = 58.0      # median idle Tccd2 that counts as a problem
 idle_load_max = 1.0         # load1 below this counts as idle
+gpu_fan_stall_power = 60.0  # a stopped fan while drawing this much is a dead fan
 cpu_tctl_crit = 89.0
 gpu_temp_warn = 88.0
 disk_warn_pct = 85.0

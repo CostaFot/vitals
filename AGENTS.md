@@ -52,8 +52,8 @@ Two flags on `Alert` decide what happens to it, and both are carried through
 - `event` - it happened rather than being true now (machine checks, NVRM
   failures, unsafe shutdowns, media errors). Fires once, no recovery notice.
 - `emergency` - it is allowed to reach the desktop. **One check sets it**: a GPU
-  fan reading 0% while the card is above 60C, confirmed across two samples a
-  minute apart. It is the only failure here that gets worse unattended and that
+  fan reading 0% while the card is drawing 60W or more, or is above 70C,
+  confirmed across two samples a minute apart. It is the only failure here that gets worse unattended and that
   nothing else watches — chips throttle, disks wait, drives are smartd's. The
   four alerts that used to set it were SMART health, NVMe critical warning,
   spare exhausted and drive-at-critical-temperature, all bits in the same NVMe
@@ -61,7 +61,8 @@ Two flags on `Alert` decide what happens to it, and both are carried through
 
   The two-sample confirm handles the driver hiccup: a lone 0% reading at any
   temperature says nothing. `fan_stopped()` is deliberately separate from
-  `sustained()`, which tests for values *above* a threshold.
+  `sustained()`, which tests for values *above* a threshold; the power side of
+  the check is `sustained()` on the `gpu_power` column over the same window.
 
   The gate was 50C until 2026-09-13, when it fired ten times overnight on a
   perfectly healthy card (COS-196). **Core temperature does not order this
@@ -70,10 +71,25 @@ Two flags on `Alert` decide what happens to it, and both are carried through
   fixed core-temp threshold separates those two, because the fan curve is
   reading the GDDR6X junction and `nvidia-smi` will not report that on a
   consumer card. 60C was picked to clear the whole observed passive plateau
-  with margin; a working fan cannot hold this card at 60C, and a dead one
-  under load passes 60C within a minute. It is still a number derived from one
-  night — `gpu_power` is now in `samples.csv` so the check can eventually ask
-  whether the card is doing work instead of guessing from temperature.
+  with margin, and held for ten days without a false fire, but it was still a
+  number from one night that could not say whether the card was working.
+
+  Since 2026-09-23 the check asks power instead (COS-197). Eleven days of
+  `gpu_power` samples: with the fan stopped the card drew 5-30W (p99 28W,
+  never above 30W across two consecutive minutes); with anything to do it
+  drew 100-285W with the fan on. The 22 fan-off rows between 50W and 200W
+  were all single samples at the moment the fan spun up, which the confirm
+  absorbs. So 0% fan while drawing 60W or more for two minutes is the alert,
+  and the temperature gate moved to 70C as a backstop for a hot card whose
+  power reading is missing — fan-off core temperature peaked at 58C in the
+  same window, so 70C is off the plateau by a wide margin.
+
+  The idle floor was retuned from the same window (COS-184). The 65C limit
+  and the "49-56C" baseline came from spot readings on 2026-09-12; the
+  minute samples put the daily median idle Tccd2 at 36-45C and 99% of idle
+  samples under 57C, so the limit is 58C. `idle_load_max = 1.0` keeps 87% of
+  samples and the median barely moves with the cut (41.8C at 0.3, 42.5C at
+  1.0), so it is neither strict nor noisy and was left alone.
 
 ## The morning read
 
@@ -189,8 +205,10 @@ EOF
 ```
 
 Change one of those `0` fan values to `47` and it must go silent — that is the
-driver-hiccup case the confirm exists for. Drop the `72` to `52` and it must
-also go silent, which is the idle plateau that used to wake the house.
+driver-hiccup case the confirm exists for. Drop the `300` power values to `20`
+and the `72` to `52` and it must also go silent, which is the idle plateau that
+used to wake the house. With power at `20` and the temperature back at `72` it
+fires again on the temperature backstop, the hot-card-with-no-reading case.
 
 smartd has its own end-to-end test, which runs the real `-M exec` path and puts a
 real toast on screen, one per drive:

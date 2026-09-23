@@ -41,11 +41,17 @@ ROOT_FACTS = Path("/var/lib/vitals/root.json")
 
 CONFIG: dict = {
     # The AIO has no readable pump RPM, so a rising *idle* CPU floor is the
-    # only early warning of a weakening pump. Baseline: Tccd2 idles 49-56C.
+    # only early warning of a weakening pump. Baseline from 11 days of
+    # minute samples (2026-09-12 to 09-23, COS-184): the daily median idle
+    # Tccd2 sat between 36C and 45C, the overall median at 42.5C, and 99% of
+    # idle samples under 57C. A median that reaches 58C has moved 14C off
+    # that floor, which a warm room does not do and a weakening pump does.
+    # The load cut barely moves the number (41.8C at <=0.3, 42.5C at <=1.0)
+    # and 1.0 keeps 87% of samples, so it stays.
     "idle_load_max": 1.0,          # load1 below this counts as idle
     "idle_window_hours": 24,
     "idle_min_samples": 30,        # don't judge the floor on thin data
-    "idle_floor_warn": 65.0,       # median idle Tccd2 above this = alert
+    "idle_floor_warn": 58.0,       # median idle Tccd2 above this = alert
     # 5900X Tjmax is 90C and it boosts into it on purpose. Only a sustained
     # sit at the ceiling means something is wrong with the cooling.
     "cpu_tctl_crit": 89.0,
@@ -59,10 +65,17 @@ CONFIG: dict = {
     # caught it restarting the fan at 42C after four hours off, then sitting
     # at 51-52C for nine hours with the fan legitimately stopped. The fan
     # curve reads the GDDR6X junction, which nvidia-smi will not report on a
-    # consumer card, so this gate only has the core to go on and has to clear
-    # the whole passive plateau. 60C does; 50C fired ten times on 2026-09-13.
-    "gpu_fan_stall_temp": 60.0,    # 0% fan while this warm = fan failure
-    "gpu_fan_confirm_minutes": 2,  # ...and still 0% this long later
+    # consumer card. Power draw does separate the cases (COS-197): in 11 days
+    # of samples the fan-off card never drew more than 30W across two
+    # consecutive minutes (p99 28W), while anything the card is actually
+    # doing sits at 100-285W with the fan on. So a stopped fan is judged on
+    # power first, and the temperature gate is a backstop for a card that is
+    # hot with no power reading, set above the whole passive plateau
+    # (fan-off core temperature peaked at 58C). 60C was the load-bearing
+    # gate until 2026-09-23; 50C fired ten times on 2026-09-13.
+    "gpu_fan_stall_power": 60.0,   # 0% fan while drawing this much = fan failure
+    "gpu_fan_stall_temp": 70.0,    # ...or while this warm, whatever the draw
+    "gpu_fan_confirm_minutes": 2,  # ...and still so this long later
     "sustained_minutes": 5,        # a gaming session is not an emergency
 
     "disk_warn_pct": 85.0,
@@ -507,10 +520,11 @@ def sustained(column: int, threshold: float, minutes: int) -> bool:
 def fan_stopped(minutes: int) -> bool:
     """True when every sample in the last `minutes` read the GPU fan at 0%.
 
-    The 3080 stops its fan below roughly 45C on purpose, so a 0% reading is
-    normal and says nothing on its own; a driver hiccup can produce one at any
-    temperature. Still 0% a minute later, with the card above the stall
-    temperature, is a fan that is not coming back.
+    The 3080 stops its fan whenever the card is doing nothing, so a 0% reading
+    is normal and says nothing on its own; a driver hiccup can produce one at
+    any temperature. Still 0% a minute later, with the card drawing real power
+    the whole time (or hot with no power reading), is a fan that is not
+    coming back.
     """
     if not SAMPLES.exists():
         return False
@@ -534,6 +548,7 @@ def fan_stopped(minutes: int) -> bool:
 TCTL_COLUMN = 2
 GPU_TEMP_COLUMN = 5
 GPU_FAN_COLUMN = 6
+GPU_POWER_COLUMN = 7
 
 
 def median(values: list[float]) -> float:
@@ -602,7 +617,7 @@ def check_cpu(snap: dict) -> list[Alert]:
         out.append(Alert(
             "cpu_idle_floor", "warn", "CPU idle temperature is drifting up",
             f"Idle Tccd2 median {floor:.1f}C over {count} idle samples "
-            f"(baseline 49-56C). Suspect the AIO pump.",
+            f"(baseline 36-45C). Suspect the AIO pump.",
             {"floor": floor, "samples": count},
         ))
     return out
@@ -657,14 +672,23 @@ def check_gpu(snap: dict) -> list[Alert]:
     # can get worse while nobody is looking: a hot chip throttles, a full disk
     # waits, a failing drive is smartd's. A dead fan under load does not stop
     # at 93C out of politeness, and the card cannot tell anyone itself.
+    # Whether the card is working is read from its power draw, not its core
+    # temperature: the fan curve follows a junction sensor the driver will not
+    # report, so a stopped fan at 50C is normal and one at 45C drawing 200W is
+    # not. The temperature gate only catches a hot card with no power reading.
     confirm = CONFIG["gpu_fan_confirm_minutes"]
-    if (fan is not None and fan == 0
-            and temp >= CONFIG["gpu_fan_stall_temp"]
+    power = gpu.get("power")
+    working = (power is not None
+               and sustained(GPU_POWER_COLUMN, CONFIG["gpu_fan_stall_power"], confirm))
+    hot = temp >= CONFIG["gpu_fan_stall_temp"]
+    if (fan is not None and fan == 0 and (working or hot)
             and fan_stopped(confirm)):
+        why = (f"drawing {power:.0f}W at {temp:.0f}C" if working
+               else f"the GPU is {temp:.0f}C")
         out.append(Alert(
             "gpu_fan", "crit", "GPU fan is not spinning",
-            f"Fan at 0% for {confirm} minutes while the GPU is {temp:.0f}C",
-            {"temp": temp, "fan": fan},
+            f"Fan at 0% for {confirm} minutes while {why}",
+            {"temp": temp, "fan": fan, "power": power},
             emergency=True,
         ))
     return out
