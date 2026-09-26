@@ -51,10 +51,8 @@ if (( WITH_SMART )); then
   # in timers.target.wants gets it rewritten to point at the copy.
   "${SUDO[@]}" systemctl reenable vitals-root.timer
   "${SUDO[@]}" systemctl start vitals-root.timer
-  # One read now, which also anchors OnUnitActiveSec. A timer enabled on a
-  # machine that booted more than a minute ago is already past its OnBootSec
-  # point, and sits elapsed with nothing scheduled until the next boot unless
-  # the service has run once to count an hour from.
+  # One read now, so root.json is fresh from the moment of install rather than
+  # at the next hour boundary.
   "${SUDO[@]}" systemctl start vitals-root.service
   echo "root timer installed: vitals-root.timer (hourly SMART read)"
 

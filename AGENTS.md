@@ -165,12 +165,16 @@ a frozen `root.json` reads exactly like a quiet drive. `install.sh` copies
 them in the repo does nothing until it is re-run. The user units stay symlinks:
 that manager starts at login, long after `/home` is up.
 
-**A timer enabled hours after boot does not fire.** `vitals-root.timer` is
-monotonic, so on a machine that booted more than a minute ago the `OnBootSec`
-point is already past and the unit goes straight to `elapsed` with nothing
-scheduled until the next boot. `install.sh` starts `vitals-root.service` once
-for that reason: the run is what `OnUnitActiveSec` counts its hour from.
-`Persistent=true` does not rescue it, applying only to `OnCalendar` timers.
+**The timer is `OnCalendar=hourly`, not monotonic.** It used to be
+`OnBootSec=1min` plus `OnUnitActiveSec=1h`, and that died on any boot where the
+timer became active more than a minute in, which a slow LUKS unlock is enough
+to cause (25 Sept 2026: 83 s in, never fired, `root.json` frozen overnight).
+The reason is `Persistent=true`: in systemd 261 the stamp file gives the timer a
+last-trigger time on every boot, and a monotonic deadline already in the past
+is then dropped instead of fired. A calendar timer has no such trap, and
+`Persistent=true` means what it says on one: a reload, a late start or a boot
+that missed the hour all re-arm it. `install.sh` still starts the service once
+so the file is fresh from install rather than the next hour boundary.
 
 ## Testing without waiting for a real fault
 
